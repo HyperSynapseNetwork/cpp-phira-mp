@@ -11,7 +11,6 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # 定义目标架构
         arch: [amd64, arm64, armhf]
         include:
           - arch: amd64
@@ -25,16 +24,12 @@ jobs:
             compiler: arm-linux-gnueabihf-g++
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install cross compiler & deps
+      - name: Install compiler & deps
         run: |
           sudo apt-get update
-          sudo apt-get install uuid-dev -y
-          sudo apt-get install -y \
-            g++-${{ matrix.triplet }} \
-            binutils-${{ matrix.triplet }}
+          sudo apt-get install -y uuid-dev g++-${{ matrix.triplet }}
 
       - name: Build
         run: |
