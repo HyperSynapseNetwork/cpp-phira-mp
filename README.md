@@ -1,6 +1,6 @@
 # cpp-phira-mp
 
-基于 [phira-mp](TeamFlos/phira-mp) 重新开发的C++版phira-mp，并添加了一些功能。
+基于 [phira-mp](https://github.com/TeamFlos/phira-mp) 重新开发的C++版phira-mp，并添加了一些功能。
 
 ## 新增功能🎉
 
