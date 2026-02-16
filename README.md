@@ -1,6 +1,6 @@
 # cpp-phira-mp
 
-基于 [phira-mp](../../../TeamFlos/phira-mp) 重新开发的C++版phira-mp，并添加了一些功能。
+基于 [phira-mp](TeamFlos/phira-mp) 重新开发的C++版phira-mp，并添加了一些功能。
 
 ## 新增功能🎉
 
@@ -63,7 +63,7 @@ make
 
 编译成功后生成 `phira-mp-server` 可执行文件。
 
-（你可以直接从本仓库的 [Github Actions](../actions) 下载对应架构的二进制Linux文件)
+（你可以直接从本仓库的 [Github Actions](../../actions) 下载对应架构的二进制Linux文件)
 
 ---
 
