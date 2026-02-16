@@ -1,19 +1,14 @@
-# Phira MP Server (C++ Enhanced)
+# cpp-phira-mp
 
-基于 cpp-phira-mp 的增强版本，新增 Web 后台管理、REST API、SSE 实时事件、封禁系统和连接欢迎信息。
+基于 [phira-mp](../../TeamFlos/phira-mp) 重新开发的C++版phira-mp，并添加了一些功能。
 
-## 新增功能
+## 新增功能🎉
 
 ### 1. 后台 Web 管理面板
 - 浏览器访问 `http://服务器IP:12345/admin`
 - 查看所有房间列表、房间状态、玩家人数及列表
-- 实时刷新（每5秒自动更新）
-- 一键解散任意房间
-- 一键踢出房间内任意玩家
-- 封禁/解封玩家 ID（封禁后连接时显示「你已被封禁」提示）
-- 封禁列表持久化存储在 `banned.txt`
 
-### 2. REST API（完整实现 api.md）
+### 2. 一些API
 
 | 接口 | 说明 |
 |------|------|
@@ -34,7 +29,6 @@
 
 ### 3. 连接欢迎信息
 - 用户认证成功后自动发送欢迎消息
-- 显示 QQ 群号：1049578201
 - 展示当前可加入的房间列表（仅显示选图中且未锁定的房间）
 
 ---
@@ -68,6 +62,8 @@ make
 ```
 
 编译成功后生成 `phira-mp-server` 可执行文件。
+
+（你可以直接从本仓库的 [Github Actions](./actions) 下载对应架构的二进制Linux文件)
 
 ---
 
@@ -136,7 +132,7 @@ cpp-phira-mp-main/
 curl http://localhost:12345/api/rooms/info
 
 # 获取指定房间
-curl http://localhost:12345/api/rooms/info/my-room
+curl http://localhost:12345/api/rooms/info/{roomid}
 
 # 获取用户所在房间
 curl http://localhost:12345/api/rooms/user/12345
@@ -151,3 +147,7 @@ curl http://localhost:12345/api/rooms/listen
 ## QQ 群
 
 **1049578201**
+
+## 协议
+
+采用 **MIT** 协议。
