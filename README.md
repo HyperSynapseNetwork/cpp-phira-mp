@@ -63,7 +63,7 @@ make
 
 编译成功后生成 `phira-mp-server` 可执行文件。
 
-（你可以直接从本仓库的 [Github Actions](../../actions) 下载对应架构的二进制Linux文件)
+（你可以直接从本仓库的 [Github Actions](../../actions) 下载对应架构的二进制Linux和Windows.exe文件)
 
 ---
 
