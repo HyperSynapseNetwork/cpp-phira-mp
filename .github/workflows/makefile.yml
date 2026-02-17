@@ -11,32 +11,68 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        arch: [amd64, arm64, armhf]
         include:
           - arch: amd64
             triplet: x86-64-linux-gnu
             compiler: g++
+            os: linux
+            suffix: ""
+            packages: g++
           - arch: arm64
             triplet: aarch64-linux-gnu
             compiler: aarch64-linux-gnu-g++
+            os: linux
+            suffix: ""
+            packages: g++-aarch64-linux-gnu
           - arch: armhf
             triplet: arm-linux-gnueabihf
             compiler: arm-linux-gnueabihf-g++
+            os: linux
+            suffix: ""
+            packages: g++-arm-linux-gnueabihf
+          - arch: amd64
+            triplet: mingw-w64
+            compiler: x86_64-w64-mingw32-g++
+            os: windows
+            suffix: .exe
+            packages: gcc-mingw-w64-x86-64
+          - arch: i686
+            triplet: mingw-w32
+            compiler: i686-w64-mingw32-g++
+            os: windows
+            suffix: .exe
+            packages: gcc-mingw-w64-i686
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install compiler & deps
+      - name: Prepare system
         run: |
           sudo apt-get update
           sudo apt-get purge needrestart
+
+      - name: Install Linux cross-compiler & deps
+        if: matrix.os == 'linux'
+        run: |
           sudo apt-get install -y uuid-dev g++-${{ matrix.triplet }}
 
+      - name: Install Windows cross-compiler
+        if: matrix.os == 'windows'
+        run: |
+          sudo apt-get install -y ${{ matrix.packages }} uuid-dev
+
       - name: Build
-        run: make
+        run: |
+          make
+
+      - name: Rename Windows executable
+        if: matrix.os == 'windows'
+        run: mv phira-mp-server phira-mp-server${{ matrix.suffix }}
 
       - name: Upload binary files
         uses: actions/upload-artifact@v4
         with:
-          name: phira-mp-server-linux-${{ matrix.arch }}
-          path: ./phira-mp-server
+          name: phira-mp-server-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            phira-mp-server
+            phira-mp-server.exe
