@@ -4,6 +4,7 @@
 #include "http_client.h"
 #include "ban_manager.h"
 #include "web_server.h"
+#include "ws_server.h"
 #include <iostream>
 #include <sstream>
 #include <cstring>
@@ -490,6 +491,29 @@ void Session::process_command(const ClientCommand& cmd) {
                 user->game_time.store(bits);
             }
             rm->broadcast_monitors(ServerCommand::touches(user->id, cmd.frames));
+
+            // WSS: broadcast touch frames as JSON
+            if (g_ws_server && cmd.frames && !cmd.frames->empty()) {
+                std::ostringstream oss;
+                oss << "[";
+                bool first = true;
+                for (auto& frame : *cmd.frames) {
+                    if (!first) oss << ",";
+                    first = false;
+                    oss << "{\"time\":" << frame.time << ",\"points\":[";
+                    bool pfirst = true;
+                    for (auto& [id, pos] : frame.points) {
+                        if (!pfirst) oss << ",";
+                        pfirst = false;
+                        oss << "{\"id\":" << (int)id
+                            << ",\"x\":" << pos.x()
+                            << ",\"y\":" << pos.y() << "}";
+                    }
+                    oss << "]}";
+                }
+                oss << "]";
+                g_ws_server->broadcast_touches(rm->id.to_string(), user->id, oss.str());
+            }
         }
         // No response for touches
         break;
@@ -500,6 +524,32 @@ void Session::process_command(const ClientCommand& cmd) {
         if (!rm) break;
         if (rm->is_live()) {
             rm->broadcast_monitors(ServerCommand::judges_cmd(user->id, cmd.judges));
+
+            // WSS: broadcast judge events as JSON
+            if (g_ws_server && cmd.judges && !cmd.judges->empty()) {
+                std::ostringstream oss;
+                oss << "[";
+                bool first = true;
+                for (auto& je : *cmd.judges) {
+                    if (!first) oss << ",";
+                    first = false;
+                    std::string jname;
+                    switch (je.judgement) {
+                        case Judgement::Perfect:     jname = "Perfect"; break;
+                        case Judgement::Good:        jname = "Good"; break;
+                        case Judgement::Bad:         jname = "Bad"; break;
+                        case Judgement::Miss:        jname = "Miss"; break;
+                        case Judgement::HoldPerfect: jname = "HoldPerfect"; break;
+                        case Judgement::HoldGood:    jname = "HoldGood"; break;
+                    }
+                    oss << "{\"time\":" << je.time
+                        << ",\"line_id\":" << je.line_id
+                        << ",\"note_id\":" << je.note_id
+                        << ",\"judgement\":\"" << jname << "\"}";
+                }
+                oss << "]";
+                g_ws_server->broadcast_judges(rm->id.to_string(), user->id, oss.str());
+            }
         }
         break;
     }
@@ -640,6 +690,7 @@ void Session::process_command(const ClientCommand& cmd) {
                   << " lock=" << cmd.flag << std::endl;
         rm->locked.store(cmd.flag);
         rm->send(Message::lock_room(cmd.flag));
+        rm->on_state_change();  // FIX: fire SSE update_room event
         try_send(ServerCommand::simple_ok(ServerCommandType::LockRoom));
         break;
     }
@@ -658,6 +709,7 @@ void Session::process_command(const ClientCommand& cmd) {
                   << " cycle=" << cmd.flag << std::endl;
         rm->cycle.store(cmd.flag);
         rm->send(Message::cycle_room(cmd.flag));
+        rm->on_state_change();  // FIX: fire SSE update_room event
         try_send(ServerCommand::simple_ok(ServerCommandType::CycleRoom));
         break;
     }
