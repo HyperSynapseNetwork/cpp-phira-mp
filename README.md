@@ -92,7 +92,7 @@ Judgement 类型：`Perfect`, `Good`, `Bad`, `Miss`, `HoldPerfect`, `HoldGood`
 
 ---
 
-## Ubuntu 安装依赖
+## 编译前准备
 
 ```bash
 # 更新包列表
@@ -122,6 +122,13 @@ make
 ```
 
 编译成功后生成 `phira-mp-server` 可执行文件。
+
+---
+
+## 下载
+
+你可以前往本项目的[Github Actions](../../../actions)，下载已编译好可直接运行的 `exe` 和二进制文件。
+
 
 ---
 
