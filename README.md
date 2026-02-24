@@ -1,8 +1,8 @@
-# Phira MP Server (C++ Enhanced)
+# ✨cpp-phira-mp✨
 
-基于 [phira-mp](https://github.com/TeamFlos/phira-mp) 重新开发的C++版phira-mp，新增 Web 后台管理、REST API、SSE 实时事件、封禁系统、管理密码、WebSocket Secure 实时数据流和连接欢迎信息。
+✨基于 [phira-mp](https://github.com/TeamFlos/phira-mp) 重新开发的C++版phira-mp，新增 Web 后台管理、REST API、SSE 实时事件、封禁系统、管理密码、WebSocket Secure 实时数据流和连接欢迎信息。✨
 
-## 新增功能
+## 特点
 
 ### 1. 后台 Web 管理面板（含密码保护）
 - 浏览器访问 `http://服务器IP:12345/admin`
@@ -15,7 +15,7 @@
 - 封禁/解封玩家 ID（封禁后连接时显示「你已被封禁」提示）
 - 封禁列表持久化存储在 `banned.txt`
 
-### 2. REST API（完整实现 api.md）
+### 2. API
 
 | 接口 | 说明 |
 |------|------|
@@ -37,7 +37,7 @@
 
 SSE 连接内建 15 秒心跳保活机制，防止连接被中间件或防火墙断开。
 
-### 3. WebSocket Secure (WSS) 实时数据流
+### 3. WebSocket实时数据流（实验性功能）
 - 为游玩中的房间提供 WSS 服务，实时推送玩家的 TouchFrame 和 JudgeEvent
 - 连接格式：`wss://[服务器IP]:[WSS端口]/[房间ID]/[玩家ID]`
 - 默认 WSS 端口：7785
