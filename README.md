@@ -127,7 +127,7 @@ make
 
 ## 下载
 
-你可以前往本项目的[Github Actions](../../../actions)，下载已编译好可直接运行的 `exe` 和二进制文件。
+你可以前往本项目的[Github Actions](../../actions)，下载已编译好可直接运行的 `exe` 和二进制文件。
 
 
 ---
