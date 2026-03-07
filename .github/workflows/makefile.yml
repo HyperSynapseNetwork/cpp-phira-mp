@@ -95,7 +95,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
-            pacman -S gcc openssl libuuid-dev --noconfirm
+            pacman -S gcc openssl libuuid-devel --noconfirm
             make
 
       - name: Build (Windows)
