@@ -4,7 +4,6 @@ on:
   push:
     branches: [ main ]
   pull_request:
-    branches: [ main ]
   release:
     types: [ created ]
 
@@ -26,14 +25,12 @@ jobs:
             os: ubuntu-latest
             target: phira-mp-server-linux-arm64
             cxx: aarch64-linux-gnu-g++
-
             packages: >-
               g++-aarch64-linux-gnu
               libssl-dev:arm64
               uuid-dev:arm64
             ldflags: -pthread -luuid -lssl -lcrypto -static
             multiarch: arm64
-
 
           - name: linux-armhf
             os: ubuntu-latest
@@ -46,22 +43,19 @@ jobs:
             ldflags: -pthread -luuid -lssl -lcrypto -static
             multiarch: armhf
 
-
           - name: windows-amd64
             os: windows-latest
-            target: phira-mp-server-windows-amd64.exe
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
 
-
       - name: Enable multiarch
         if: runner.os == 'Linux' && matrix.multiarch != ''
         run: |
-          sudo dpkg --add-architecture ${{ matrix.multiarch }}
           sudo apt-get update
+          sudo dpkg --add-architecture ${{ matrix.multiarch }}
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -77,6 +71,7 @@ jobs:
             TARGET=${{ matrix.target }} \
             LDFLAGS="${{ matrix.ldflags }}"
 
+      # ── Windows: MSYS2 + MinGW-w64 ───────────────────────────
       - name: Setup MSYS2 (Windows)
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
@@ -86,6 +81,7 @@ jobs:
           install: >-
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-libuuid
             make
 
       - name: Build (Windows)
@@ -95,12 +91,12 @@ jobs:
           make \
             CXX=x86_64-w64-mingw32-g++ \
             TARGET=phira-mp-server-windows-amd64.exe \
-            LDFLAGS="-pthread -lssl -lcrypto -lrpcrt4 -lws2_32 -lcrypt32 -static"
+            LDFLAGS="-pthread -luuid -lssl -lcrypto -lws2_32 -lcrypt32 -static"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: phira-mp-server-${{ matrix.name }}
+          name: phira-mp-server${{ matrix.name }}
           path: |
             phira-mp-server-*
             *.exe
