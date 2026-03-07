@@ -1,78 +1,106 @@
-name: Makefile CI
+name: Cross Compile phira-mp-server
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ main ]
+  release:
+    types: [ created ]
 
 jobs:
   build:
-    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - arch: amd64
-            triplet: x86-64-linux-gnu
-            compiler: g++
-            os: linux
-            suffix: ""
-            packages: g++
-          - arch: arm64
-            triplet: aarch64-linux-gnu
-            compiler: aarch64-linux-gnu-g++
-            os: linux
-            suffix: ""
-            packages: g++-aarch64-linux-gnu
-          - arch: armhf
-            triplet: arm-linux-gnueabihf
-            compiler: arm-linux-gnueabihf-g++
-            os: linux
-            suffix: ""
-            packages: g++-arm-linux-gnueabihf
-          - arch: amd64
-            triplet: mingw-w64
-            compiler: x86_64-w64-mingw32-g++
-            os: windows
-            suffix: .exe
-            packages: gcc-mingw-w64-x86-64
-          - arch: i686
-            triplet: mingw-w32
-            compiler: i686-w64-mingw32-g++
-            os: windows
-            suffix: .exe
-            packages: gcc-mingw-w64-i686
+
+          - name: linux-amd64
+            os: ubuntu-latest
+            target: phira-mp-server-linux-amd64
+            cxx: g++
+            packages: build-essential libssl-dev uuid-dev
+            ldflags: -pthread -luuid -lssl -lcrypto -static
+
+          - name: linux-arm64
+            os: ubuntu-latest
+            target: phira-mp-server-linux-arm64
+            cxx: aarch64-linux-gnu-g++
+
+            packages: >-
+              g++-aarch64-linux-gnu
+              libssl-dev:arm64
+              uuid-dev:arm64
+            ldflags: -pthread -luuid -lssl -lcrypto -static
+            multiarch: arm64
+
+
+          - name: linux-armhf
+            os: ubuntu-latest
+            target: phira-mp-server-linux-armhf
+            cxx: arm-linux-gnueabihf-g++
+            packages: >-
+              g++-arm-linux-gnueabihf
+              libssl-dev:armhf
+              uuid-dev:armhf
+            ldflags: -pthread -luuid -lssl -lcrypto -static
+            multiarch: armhf
+
+
+          - name: windows-amd64
+            os: windows-latest
+            target: phira-mp-server-windows-amd64.exe
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prepare system
+
+      - name: Enable multiarch
+        if: runner.os == 'Linux' && matrix.multiarch != ''
+        run: |
+          sudo dpkg --add-architecture ${{ matrix.multiarch }}
+          sudo apt-get update
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get purge needrestart
+          sudo apt-get install -y ${{ matrix.packages }}
 
-      - name: Install Linux cross-compiler & deps
-        if: matrix.os == 'linux'
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
         run: |
-          sudo apt-get install -y uuid-dev g++-${{ matrix.triplet }}
+          make \
+            CXX=${{ matrix.cxx }} \
+            TARGET=${{ matrix.target }} \
+            LDFLAGS="${{ matrix.ldflags }}"
 
-      - name: Install Windows cross-compiler
-        if: matrix.os == 'windows'
+      - name: Setup MSYS2 (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-openssl
+            make
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
         run: |
-          sudo apt-get install -y ${{ matrix.packages }} uuid-dev
+          make \
+            CXX=x86_64-w64-mingw32-g++ \
+            TARGET=phira-mp-server-windows-amd64.exe \
+            LDFLAGS="-pthread -lssl -lcrypto -lrpcrt4 -lws2_32 -lcrypt32 -static"
 
-      - name: Build
-        run: |
-          make
-
-      - name: Rename Windows executable
-        if: matrix.os == 'windows'
-        run: mv phira-mp-server phira-mp-server${{ matrix.suffix }}
-
-      - name: Upload binary files
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: phira-mp-server-${{ matrix.os }}-${{ matrix.arch }}
+          name: phira-mp-server-${{ matrix.name }}
           path: |
-            phira-mp-server
-            phira-mp-server.exe
+            phira-mp-server-*
+            *.exe
