@@ -14,6 +14,7 @@ jobs:
       matrix:
         include:
 
+          # ── Linux amd64 ────────────────────────────────────────
           - name: linux-amd64
             os: ubuntu-latest
             target: phira-mp-server-linux-amd64
@@ -21,28 +22,25 @@ jobs:
             packages: build-essential libssl-dev uuid-dev
             ldflags: -pthread -luuid -lssl -lcrypto -static
 
+          # ── Linux arm64 ────────────────────────────────────────
           - name: linux-arm64
             os: ubuntu-latest
             target: phira-mp-server-linux-arm64
             cxx: aarch64-linux-gnu-g++
-            packages: >-
-              g++-aarch64-linux-gnu
-              libssl-dev
-              uuid-dev
+            packages: g++-aarch64-linux-gnu libssl-dev:arm64 uuid-dev:arm64
             ldflags: -pthread -luuid -lssl -lcrypto -static
             multiarch: arm64
 
+          # ── Linux armhf ────────────────────────────────────────
           - name: linux-armhf
             os: ubuntu-latest
             target: phira-mp-server-linux-armhf
             cxx: arm-linux-gnueabihf-g++
-            packages: >-
-              g++-arm-linux-gnueabihf
-              libssl-dev
-              uuid-dev
+            packages: g++-arm-linux-gnueabihf libssl-dev:armhf uuid-dev:armhf
             ldflags: -pthread -luuid -lssl -lcrypto -static
             multiarch: armhf
 
+          # ── Windows amd64 ──────────────────────────────────────
           - name: windows-amd64
             os: windows-latest
 
@@ -51,16 +49,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Enable multiarch
+      # ── Linux arm64/armhf：修复 apt 多架构源 ─────────────────
+      - name: Fix apt sources for multiarch
         if: runner.os == 'Linux' && matrix.multiarch != ''
         run: |
-          sudo apt-get update
+          sudo sed -i 's/^deb http/deb [arch=amd64] http/g' /etc/apt/sources.list
+          sudo sed -i 's/^deb mirror/deb [arch=amd64] mirror/g' /etc/apt/sources.list
+
+          CODENAME=$(lsb_release -cs)
+          cat <<EOF | sudo tee /etc/apt/sources.list.d/ports.list
+          deb [arch=${{ matrix.multiarch }}] http://ports.ubuntu.com/ubuntu-ports ${CODENAME} main restricted universe multiverse
+          deb [arch=${{ matrix.multiarch }}] http://ports.ubuntu.com/ubuntu-ports ${CODENAME}-updates main restricted universe multiverse
+          deb [arch=${{ matrix.multiarch }}] http://ports.ubuntu.com/ubuntu-ports ${CODENAME}-security main restricted universe multiverse
+          EOF
+
           sudo dpkg --add-architecture ${{ matrix.multiarch }}
+          sudo apt-get update
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
+          # amd64 不需要修改源，直接 update
+          if [ -z "${{ matrix.multiarch }}" ]; then
+            sudo apt-get update
+          fi
           sudo apt-get install -y ${{ matrix.packages }}
 
       - name: Build (Linux)
@@ -71,17 +83,19 @@ jobs:
             TARGET=${{ matrix.target }} \
             LDFLAGS="${{ matrix.ldflags }}"
 
-      # ── Windows: MSYS2 + MinGW-w64 ───────────────────────────
+      # ── Windows: MSYS2 + pacman ───────────────────────────────
       - name: Setup MSYS2 (Windows)
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: true
-          install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-openssl
-            mingw-w64-x86_64-libuuid-dev
+
+      - name: Install Windows dependencies via pacman
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+            pacman -S gcc openssl libuuid-dev --noconfirm
             make
 
       - name: Build (Windows)
@@ -93,10 +107,11 @@ jobs:
             TARGET=phira-mp-server-windows-amd64.exe \
             LDFLAGS="-pthread -luuid -lssl -lcrypto -lws2_32 -lcrypt32 -static"
 
+      # ── 上传产物 ──────────────────────────────────────────────
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: phira-mp-server${{ matrix.name }}
+          name: ${{ matrix.name }}
           path: |
             phira-mp-server-*
             *.exe
