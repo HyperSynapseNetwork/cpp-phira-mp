@@ -1,11 +1,13 @@
-CXX = g++
-CXXFLAGS = -std=c++20 -Wall -Wextra -O2 -pthread -Iinclude -static
-LDFLAGS = -pthread -luuid -lssl -lcrypto -static
+CXX      ?= g++
+CXXFLAGS ?= -std=c++20 -Wall -Wextra -O2 -pthread -Iinclude -static
+
+# 各平台通过命令行覆盖 LDFLAGS，默认为 Linux
+LDFLAGS  ?= -pthread -luuid -lssl -lcrypto -static
 
 SRCDIR = src
 INCDIR = include
 OBJDIR = obj
-TARGET = phira-mp-server
+TARGET ?= phira-mp-server
 
 SOURCES = $(wildcard $(SRCDIR)/*.cpp)
 OBJECTS = $(patsubst $(SRCDIR)/%.cpp,$(OBJDIR)/%.o,$(SOURCES))
@@ -24,7 +26,7 @@ $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
 clean:
-	rm -rf $(OBJDIR) $(TARGET)
+	rm -rf $(OBJDIR) $(TARGET) $(TARGET).exe
 
 # Dependencies
 $(OBJDIR)/main.o: $(INCDIR)/server.h $(INCDIR)/l10n.h $(INCDIR)/ban_manager.h $(INCDIR)/web_server.h $(INCDIR)/ws_server.h
