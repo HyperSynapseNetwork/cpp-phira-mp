@@ -27,8 +27,8 @@ jobs:
             cxx: aarch64-linux-gnu-g++
             packages: >-
               g++-aarch64-linux-gnu
-              libssl-dev:arm64
-              uuid-dev:arm64
+              libssl-dev
+              uuid-dev
             ldflags: -pthread -luuid -lssl -lcrypto -static
             multiarch: arm64
 
@@ -38,8 +38,8 @@ jobs:
             cxx: arm-linux-gnueabihf-g++
             packages: >-
               g++-arm-linux-gnueabihf
-              libssl-dev:armhf
-              uuid-dev:armhf
+              libssl-dev
+              uuid-dev
             ldflags: -pthread -luuid -lssl -lcrypto -static
             multiarch: armhf
 
@@ -81,7 +81,7 @@ jobs:
           install: >-
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-openssl
-            mingw-w64-x86_64-libuuid
+            mingw-w64-x86_64-libuuid-dev
             make
 
       - name: Build (Windows)
