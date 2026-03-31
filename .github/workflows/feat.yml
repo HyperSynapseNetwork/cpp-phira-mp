@@ -1,8 +1,10 @@
-name: Feat CI
+name: Makefile CI
 
 on:
   push:
-    branches: [ "feat" ]
+    tags:
+      - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
