@@ -39,6 +39,7 @@ jobs:
       - name: Enable multiarch
         if: matrix.arch != 'amd64'
         run: |
+          sudo apt-get update
           sudo dpkg --add-architecture ${{ matrix.pkg_arch }}
 
           # Replace sources to add arch-specific URIs
