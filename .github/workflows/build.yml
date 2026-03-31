@@ -1,0 +1,191 @@
+name: Makefile CI
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            triplet: x86_64-linux-gnu
+            pkg_arch: amd64
+            cc: gcc
+            cxx: g++
+          - arch: arm64
+            triplet: aarch64-linux-gnu
+            pkg_arch: arm64
+            cc: aarch64-linux-gnu-gcc
+            cxx: aarch64-linux-gnu-g++
+          - arch: armhf
+            triplet: arm-linux-gnueabihf
+            pkg_arch: armhf
+            cc: arm-linux-gnueabihf-gcc
+            cxx: arm-linux-gnueabihf-g++
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable multiarch
+        if: matrix.arch != 'amd64'
+        run: |
+          sudo dpkg --add-architecture ${{ matrix.pkg_arch }}
+
+          # Replace sources to add arch-specific URIs
+          sudo tee /etc/apt/sources.list.d/multiarch.list > /dev/null << 'SOURCES'
+          deb [arch=${{ matrix.pkg_arch }}] http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
+          deb [arch=${{ matrix.pkg_arch }}] http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse
+          deb [arch=${{ matrix.pkg_arch }}] http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse
+          SOURCES
+
+          sudo apt-get update -qq
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            sudo apt-get install -y -qq \
+              g++ pkg-config \
+              libboost-dev libcurl4-openssl-dev libssl-dev \
+              libspdlog-dev libargon2-dev nlohmann-json3-dev uuid-dev
+          else
+            sudo apt-get install -y -qq \
+              g++-${{ matrix.triplet }} pkg-config \
+              libboost-dev:${{ matrix.pkg_arch }} \
+              libcurl4-openssl-dev:${{ matrix.pkg_arch }} \
+              libssl-dev:${{ matrix.pkg_arch }} \
+              libspdlog-dev:${{ matrix.pkg_arch }} \
+              libargon2-dev:${{ matrix.pkg_arch }} \
+              nlohmann-json3-dev:${{ matrix.pkg_arch }} \
+              uuid-dev:${{ matrix.pkg_arch }}
+          fi
+
+      - name: Build
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            make -j$(nproc)
+          else
+            # Cross-compile: point pkg-config to the right architecture
+            export PKG_CONFIG_PATH=/usr/lib/${{ matrix.triplet }}/pkgconfig
+            export PKG_CONFIG_LIBDIR=/usr/lib/${{ matrix.triplet }}/pkgconfig
+            make -j$(nproc) CXX=${{ matrix.cxx }}
+          fi
+          strip phira-mp-server || ${{ matrix.triplet }}-strip phira-mp-server || true
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp phira-mp-server dist/
+          cp -r locales dist/
+          tar czf phira-mp-server-linux-${{ matrix.arch }}.tar.gz -C dist .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phira-mp-server-linux-${{ matrix.arch }}
+          path: phira-mp-server-linux-${{ matrix.arch }}.tar.gz
+
+
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-make
+            mingw-w64-ucrt-x86_64-pkg-config
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-curl
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-spdlog
+            mingw-w64-ucrt-x86_64-argon2
+            mingw-w64-ucrt-x86_64-nlohmann-json
+
+      - name: Build
+        run: |
+          # Windows: uuid comes from rpcrt4, not libuuid
+          cat > Makefile.win << 'MF'
+          CXX      := g++
+          CXXFLAGS := -std=c++20 -Wall -Wextra -O2 -pthread -DWIN32_LEAN_AND_MEAN
+          INCLUDES := -Iinclude
+          CXXFLAGS += $(shell pkg-config --cflags spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
+          LIBS := $(shell pkg-config --libs spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null) \
+                  -lrpcrt4 -lws2_32 -lwsock32 -lpthread
+          SRCS := src/main.cpp src/binary.cpp src/command.cpp src/stream.cpp \
+                  src/l10n.cpp src/room.cpp src/session.cpp src/server.cpp \
+                  src/http_server.cpp
+          OBJS := $(SRCS:.cpp=.o)
+          TARGET := phira-mp-server.exe
+          LOCALES_DIR := locales
+          CXXFLAGS += -DLOCALES_DIR=\"$(LOCALES_DIR)\"
+          .PHONY: all clean
+          all: $(TARGET)
+          $(TARGET): $(OBJS)
+          	$(CXX) $(CXXFLAGS) -o $@ $^ $(LIBS) -static
+          src/%.o: src/%.cpp
+          	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<
+          clean:
+          	rm -f $(OBJS) $(TARGET)
+          MF
+          mingw32-make -f Makefile.win -j$(nproc)
+          strip phira-mp-server.exe || true
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp phira-mp-server.exe dist/
+          cp -r locales dist/
+          # Collect needed DLLs
+          for dll in $(ldd phira-mp-server.exe 2>/dev/null | grep ucrt64 | awk '{print $3}'); do
+            cp "$dll" dist/ 2>/dev/null || true
+          done
+
+      - name: Create zip
+        shell: pwsh
+        run: Compress-Archive -Path dist\* -DestinationPath phira-mp-server-windows-amd64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phira-mp-server-windows-amd64
+          path: phira-mp-server-windows-amd64.zip
+
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/phira-mp-server-linux-amd64/phira-mp-server-linux-amd64.tar.gz
+            artifacts/phira-mp-server-linux-arm64/phira-mp-server-linux-arm64.tar.gz
+            artifacts/phira-mp-server-linux-armhf/phira-mp-server-linux-armhf.tar.gz
+            artifacts/phira-mp-server-windows-amd64/phira-mp-server-windows-amd64.zip
+          generate_release_notes: true

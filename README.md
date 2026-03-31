@@ -37,53 +37,7 @@
 
 SSE 连接内建 15 秒心跳保活机制，防止连接被中间件或防火墙断开。
 
-### 3. WebSocket实时数据流（实验性功能）
-- 为游玩中的房间提供 WSS 服务，实时推送玩家的 TouchFrame 和 JudgeEvent
-- 连接格式：`wss://[服务器IP]:[WSS端口]/[房间ID]/[玩家ID]`
-- 默认 WSS 端口：7785
-- 需要 TLS 证书（通过命令行参数 `--tls-cert` 和 `--tls-key` 指定）
-
-#### WSS 数据格式
-连接成功后会收到确认消息：
-```json
-{"type":"connected","room":"room-id","player":12345}
-```
-
-TouchFrame 实时推送：
-```json
-{
-  "type": "touch_frame",
-  "room": "room-id",
-  "player": 12345,
-  "data": [
-    {
-      "time": 1.234,
-      "points": [
-        {"id": 0, "x": 0.5, "y": 0.3}
-      ]
-    }
-  ]
-}
-```
-
-JudgeEvent 实时推送：
-```json
-{
-  "type": "judge_event",
-  "room": "room-id",
-  "player": 12345,
-  "data": [
-    {
-      "time": 1.234,
-      "line_id": 0,
-      "note_id": 1,
-      "judgement": "Perfect"
-    }
-  ]
-}
-```
-
-Judgement 类型：`Perfect`, `Good`, `Bad`, `Miss`, `HoldPerfect`, `HoldGood`
+### 3. 本程序可搭配 [phira-web-monitor](https://github.com/HyperSynapseNetwork/phira-web/monitor)进行观战。
 
 ### 4. 连接欢迎信息
 - 用户认证成功后自动发送欢迎消息
@@ -99,7 +53,7 @@ Judgement 类型：`Perfect`, `Good`, `Bad`, `Miss`, `HoldPerfect`, `HoldGood`
 sudo apt update
 
 # 安装编译工具和依赖
-sudo apt install -y build-essential g++ uuid-dev curl libssl-dev
+sudo apt install -y build-essential g++ pkg-config uuid-dev curl libssl-dev libboost-dev libspdlog-dev libargon2-dev nlohmann-json3-dev libcurl4-openssl-dev
 ```
 
 ### 所需依赖清单
@@ -116,7 +70,7 @@ sudo apt install -y build-essential g++ uuid-dev curl libssl-dev
 ## 编译
 
 ```bash
-cd cpp-phira-mp-main
+cd cpp-phira-mp
 make clean
 make
 ```
@@ -135,30 +89,20 @@ make
 ## 运行
 
 ```bash
-# 默认端口运行（游戏端口 12346，Web 端口 12345，WSS 端口 7785）
+# 默认端口运行（默认为游戏端口 12346，Web/api 端口 12347，后台管理密码 admin）
 ./phira-mp-server
 
 # 自定义端口
-./phira-mp-server -p 12346 -w 8080 -s 7785
+./phira-mp-server --port 12346 --http-port 12347 --admin-password PASSWORD
 
-# 指定 TLS 证书
-./phira-mp-server --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
-
-# 后台运行
-nohup ./phira-mp-server -p 12346 -w 12345 -s 7785 \
-  --tls-cert /etc/ssl/certs/server.crt \
-  --tls-key /etc/ssl/private/server.key \
-  > server.log 2>&1 &
 ```
 
 ### 命令行参数
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `-p, --port` | 游戏服务器端口 | 12346 |
-| `-w, --web-port` | Web 管理/API 端口 | 12345 |
-| `-s, --wss-port` | WebSocket Secure 端口 | 7785 |
-| `--tls-cert` | TLS 证书文件路径 | /etc/ssl/certs/server.crt |
-| `--tls-key` | TLS 私钥文件路径 | /etc/ssl/private/server.key |
+| `--port` | 游戏服务器端口 | 12346 |
+| `--http-port` | Web 管理/API 端口 | 12347 |
+| `--admin-password` | 后台管理密码 | admin |
 | `-h, --help` | 显示帮助 | - |
 
 ---
@@ -168,37 +112,35 @@ nohup ./phira-mp-server -p 12346 -w 12345 -s 7785 \
 ```
 cpp-phira-mp-main/
 ├── include/
-│   ├── ban_manager.h      # 封禁管理
-│   ├── binary_protocol.h  # 二进制协议
-│   ├── commands.h          # 命令定义
-│   ├── http_client.h       # HTTP 客户端
-│   ├── l10n.h              # 本地化
-│   ├── room.h              # 房间 + 轮次历史
-│   ├── server.h            # 服务器 + get_state()
-│   ├── session.h           # 会话
-│   ├── web_server.h        # [修改] Web 服务器（含密码管理）
-│   └── ws_server.h         # [新增] WebSocket Secure 服务器
+│   ├── binary.hpp          # 二进制协议
+│   ├── command.hpp         # 命令定义
+│   ├── http_server.hpp     # HTTP 客户端
+│   ├── l10n.hpp            # 本地化
+│   ├── room.hpp            # 房间 + 轮次历史
+│   ├── server.hpp          # 服务器 + get_state()
+│   ├── session.hpp         # 会话
+│   ├── stream.hpp          # 触摸信息流
 ├── src/
-│   ├── http_client.cpp
-│   ├── l10n.cpp
-│   ├── main.cpp            # [修改] 主入口 + WSS 启动
-│   ├── room.cpp            # 轮次记录 + SSE
-│   ├── server.cpp
-│   ├── session.cpp         # [修改] WSS 广播 + SSE 修复
-│   ├── web_server.cpp      # [修改] 密码管理 + SSE 修复
-│   └── ws_server.cpp       # [新增] WSS 服务器实现
+│   ├── binary.cpp          # 二进制协议实现
+│   ├── command.cpp         # 命令实现
+│   ├── http_server.cpp     # web/api实现
+│   ├── l10n.cpp            # 本地化实现
+│   ├── main.cpp            # 主入口
+│   ├── room.cpp            # 主逻辑实现
+│   ├── server.cpp          # 服务器
+│   ├── session.cpp         # 主逻辑实现
+│   └── stream.cpp          # [新增] 观战协议
 ├── locales/
 │   ├── en-US.ftl
 │   ├── zh-CN.ftl
 │   └── zh-TW.ftl
-├── Makefile                # [修改] 新增 OpenSSL 依赖
+├── Makefile
+├── CMakeLists.txt
 └── README.md
 ```
 
 ### 运行时文件
-- `banned.txt` — 封禁玩家 ID 列表（自动创建/管理）
-- `admin_password.txt` — 管理密码（自动创建，默认 admin123）
-- `server_config.yml` — 服务器配置（可选）
+- `banned_user.txt` — 封禁玩家 ID 列表（自动创建/管理）
 
 ---
 
@@ -217,59 +159,8 @@ curl http://localhost:12345/api/rooms/user/12345
 # 监听实时事件（SSE）
 curl http://localhost:12345/api/rooms/listen
 
-# 登录管理面板（获取 token）
-curl -X POST http://localhost:12345/admin/login \
-  -H 'Content-Type: application/json' -d '{"password": "admin123"}'
-
-# 封禁玩家（需要 admin_token cookie）
-curl -X POST http://localhost:12345/admin/ban \
-  -H 'Content-Type: application/json' \
-  -b 'admin_token=YOUR_TOKEN' \
-  -d '{"user_id": 12345}'
-
-# 解封玩家
-curl -X POST http://localhost:12345/admin/unban \
-  -H 'Content-Type: application/json' \
-  -b 'admin_token=YOUR_TOKEN' \
-  -d '{"user_id": 12345}'
-
-# 解散房间
-curl -X POST http://localhost:12345/admin/dissolve \
-  -H 'Content-Type: application/json' \
-  -b 'admin_token=YOUR_TOKEN' \
-  -d '{"room": "room-name"}'
-
-# 踢出玩家
-curl -X POST http://localhost:12345/admin/kick \
-  -H 'Content-Type: application/json' \
-  -b 'admin_token=YOUR_TOKEN' \
-  -d '{"room":"room-name","user_id":12345}'
-
-# 修改管理密码
-curl -X POST http://localhost:12345/admin/change_password \
-  -H 'Content-Type: application/json' \
-  -b 'admin_token=YOUR_TOKEN' \
-  -d '{"old_password":"admin123","new_password":"newpass"}'
 ```
 
-### WSS 连接示例（JavaScript）
-
-```javascript
-const ws = new WebSocket('wss://your-server:7785/room-id/12345');
-
-ws.onopen = () => console.log('WSS connected');
-
-ws.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  if (data.type === 'touch_frame') {
-    console.log('Touch frames:', data.data);
-  } else if (data.type === 'judge_event') {
-    console.log('Judge events:', data.data);
-  }
-};
-
-ws.onclose = () => console.log('WSS disconnected');
-```
 
 ---
 

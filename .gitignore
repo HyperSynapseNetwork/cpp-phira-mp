@@ -1,0 +1,8 @@
+*.o
+phira-mp-server
+phira-mp-server.exe
+log/
+build/
+banned_users.json
+*.tar.gz
+*.zip

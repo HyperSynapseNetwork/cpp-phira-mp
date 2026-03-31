@@ -1,941 +1,520 @@
-#include "session.h"
-#include "room.h"
-#include "server.h"
-#include "http_client.h"
-#include "ban_manager.h"
-#include "web_server.h"
-#include "ws_server.h"
-#include <iostream>
-#include <sstream>
-#include <cstring>
-#include <algorithm>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "session.hpp"
+#include "server.hpp"
+#include <spdlog/spdlog.h>
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
 #include <thread>
+#include <cstring>
 
-static const char* HOST_URL = "https://phira.5wyxi.com";
+static const std::string PHIRA_HOST = "https://phira.5wyxi.com";
 
-// ══════════════════════════════════════════════════════════════════════
-// SendQueue
-// ══════════════════════════════════════════════════════════════════════
-
-void SendQueue::push(ServerCommand cmd) {
-    {
-        std::lock_guard<std::mutex> lock(mtx_);
-        if (closed_.load()) return;
-        queue_.push(std::move(cmd));
-    }
-    cv_.notify_one();
+// ── CURL helper ───────────────────────────────────────────────────────
+static size_t curl_cb(void* p, size_t sz, size_t nm, std::string* o) { o->append((char*)p, sz*nm); return sz*nm; }
+static std::string http_get(const std::string& url, const std::string& auth = "") {
+    CURL* c = curl_easy_init(); if (!c) throw std::runtime_error("CURL init fail");
+    std::string resp;
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
+    struct curl_slist* hdrs = nullptr;
+    if (!auth.empty()) { hdrs = curl_slist_append(hdrs, ("Authorization: " + auth).c_str()); curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs); }
+    CURLcode rc = curl_easy_perform(c); long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    if (hdrs) curl_slist_free_all(hdrs); curl_easy_cleanup(c);
+    if (rc != CURLE_OK) throw std::runtime_error(std::string("HTTP fail: ") + curl_easy_strerror(rc));
+    if (code >= 400) throw std::runtime_error("HTTP " + std::to_string(code));
+    return resp;
 }
 
-bool SendQueue::pop(ServerCommand& cmd, int timeout_ms) {
-    std::unique_lock<std::mutex> lock(mtx_);
-    if (cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-                     [this] { return !queue_.empty() || closed_.load(); })) {
-        if (closed_.load() && queue_.empty()) return false;
-        cmd = std::move(queue_.front());
-        queue_.pop();
-        return true;
-    }
-    return false;
+struct AuthResult { int32_t id; std::string name, language; };
+static AuthResult authenticate_http(const std::string& token) {
+    if (token.size() > 32) throw std::runtime_error("invalid token length");
+    auto body = http_get(PHIRA_HOST + "/me", "Bearer " + token);
+    auto j = nlohmann::json::parse(body);
+    return { j.at("id").get<int32_t>(), j.at("name").get<std::string>(), j.value("language", "en-US") };
 }
 
-void SendQueue::close() {
-    closed_.store(true);
-    cv_.notify_all();
-}
+// ── User ──────────────────────────────────────────────────────────────
+User::User(int32_t id, const std::string& name, Lang lang,
+           std::shared_ptr<ServerState> srv, asio::io_context& ioc)
+    : id(id), name(name), lang(lang), server(std::move(srv)), ioc(ioc) {}
 
-bool SendQueue::is_closed() const {
-    return closed_.load();
-}
-
-// ══════════════════════════════════════════════════════════════════════
-// User
-// ══════════════════════════════════════════════════════════════════════
-
-User::User(int32_t id_, std::string name_, Language lang_, std::shared_ptr<ServerState> srv)
-    : id(id_), name(std::move(name_)), lang(std::move(lang_)), server(std::move(srv)) {}
-
-UserInfo User::to_info() const {
-    UserInfo info;
-    info.id = id;
-    info.name = name;
-    info.monitor = monitor.load();
-    return info;
-}
-
-bool User::can_monitor() const {
-    for (auto m : server->config.monitors) {
-        if (m == id) return true;
-    }
-    return false;
-}
-
+UserInfo User::to_info() const { return {id, name, monitor.load(std::memory_order_seq_cst)}; }
+bool User::can_monitor() const { for (auto m : server->config.monitors) if (m == id) return true; return false; }
 void User::set_session(std::weak_ptr<Session> s) {
-    std::unique_lock lock(session_mtx);
-    session = std::move(s);
-    // Clear dangle mark
-    std::lock_guard dlock(dangle_mtx);
-    dangle_mark.reset();
+    { std::unique_lock lk(session_mu); session = s; }
+    { std::lock_guard lk(dangle_mu); dangle_mark.reset(); if (dangle_timer) { dangle_timer->cancel(); dangle_timer.reset(); } }
 }
-
-void User::try_send(ServerCommand cmd) const {
-    std::shared_lock lock(session_mtx);
-    auto s = session.lock();
-    if (s) {
-        s->try_send(std::move(cmd));
-    } else {
-        std::cerr << "[user] sending to dangling user " << id << std::endl;
-    }
+void User::try_send(const ServerCommand& cmd) {
+    std::shared_lock lk(session_mu); if (auto s = session.lock()) s->try_send(cmd);
+    else spdlog::warn("sending to dangling user {}", id);
 }
-
 void User::dangle() {
-    std::cerr << "[user] user " << id << " dangling" << std::endl;
-
-    // If playing, abort immediately
-    auto rm = get_room();
+    spdlog::warn("user {} dangling", id);
+    std::shared_ptr<Room> rm;
+    { std::shared_lock lk(room_mu); rm = room; }
     if (rm) {
-        std::shared_lock sl(rm->state_mtx);
-        if (rm->state.type == InternalRoomStateType::Playing) {
-            std::cerr << "[user] lost connection on playing, aborting user " << id << std::endl;
-            sl.unlock();
-            {
-                std::unique_lock lock(server->users_mtx);
-                server->users.erase(id);
-            }
-            // Clear room ref before on_user_leave
-            {
-                std::unique_lock rl(room_mtx);
-                room.reset();
-            }
-            if (rm->on_user_leave(*this)) {
-                std::unique_lock lock(server->rooms_mtx);
-                server->rooms.erase(rm->id.to_string());
-            }
+        std::shared_lock lk(rm->state_mu);
+        if (rm->state.type == InternalRoomState::Type::Playing) {
+            spdlog::warn("user {}: lost in playing, abort", id); lk.unlock();
+            { std::unique_lock ul(server->users_mu); server->users.erase(id); }
+            if (rm->on_user_leave(*this)) { std::unique_lock rl(server->rooms_mu); server->rooms.erase(rm->id.to_string()); }
             return;
         }
     }
-
-    // Set up dangle mark and start timeout
     auto mark = std::make_shared<int>(0);
-    {
-        std::lock_guard lock(dangle_mtx);
-        dangle_mark = mark;
-    }
-
-    // Capture what we need for the cleanup thread
-    auto self_id = id;
-    auto self_server = server;
-
-    // weak_ptr to self for the timeout thread
-    // We need shared_from_this but User might not be in a shared_ptr context always
-    // Instead, just use the dangle mark for timeout check
-
-    std::thread([mark, self_id, self_server, rm_copy = rm]() mutable {
-        std::this_thread::sleep_for(std::chrono::seconds(10));
-        // If mark use_count > 1, the user hasn't reconnected (mark still stored in dangle_mark)
-        if (mark.use_count() > 1) {
-            std::cerr << "[user] dangle timeout for user " << self_id << std::endl;
-            // Remove from users
-            std::shared_ptr<User> user_ptr;
-            {
-                std::shared_lock lock(self_server->users_mtx);
-                auto it = self_server->users.find(self_id);
-                if (it != self_server->users.end()) user_ptr = it->second;
-            }
-            if (user_ptr) {
-                auto rm2 = user_ptr->get_room();
-                if (rm2) {
-                    {
-                        std::unique_lock rl(user_ptr->room_mtx);
-                        user_ptr->room.reset();
-                    }
-                    {
-                        std::unique_lock lock(self_server->users_mtx);
-                        self_server->users.erase(self_id);
-                    }
-                    if (rm2->on_user_leave(*user_ptr)) {
-                        std::unique_lock lock(self_server->rooms_mtx);
-                        self_server->rooms.erase(rm2->id.to_string());
-                    }
-                } else {
-                    std::unique_lock lock(self_server->users_mtx);
-                    self_server->users.erase(self_id);
-                }
-            }
+    { std::lock_guard lk(dangle_mu); dangle_mark = mark; }
+    auto timer = std::make_shared<asio::steady_timer>(ioc, std::chrono::seconds(10));
+    { std::lock_guard lk(dangle_mu); dangle_timer = timer; }
+    auto self = shared_from_this();
+    timer->async_wait([self, mark, timer](const error_code& ec) {
+        if (ec) return;
+        if (mark.use_count() <= 1) return;
+        std::shared_ptr<Room> rm;
+        { std::shared_lock lk(self->room_mu); rm = self->room; }
+        if (rm) {
+            { std::unique_lock ul(self->server->users_mu); self->server->users.erase(self->id); }
+            if (rm->on_user_leave(*self)) { std::unique_lock rl(self->server->rooms_mu); self->server->rooms.erase(rm->id.to_string()); }
         }
-    }).detach();
+    });
 }
 
-std::shared_ptr<Room> User::get_room() const {
-    std::shared_lock lock(room_mtx);
-    return room;
+// ── Session ───────────────────────────────────────────────────────────
+Session::Session(Uuid id, std::shared_ptr<ServerState> srv, asio::io_context& ioc)
+    : id(id), server_(std::move(srv)), ioc_(ioc), last_recv_(std::chrono::steady_clock::now()) {}
+
+std::shared_ptr<Session> Session::create(Uuid id, tcp::socket sock, std::shared_ptr<ServerState> srv, asio::io_context& ioc) {
+    auto s = std::shared_ptr<Session>(new Session(id, srv, ioc));
+    s->stream_ = std::make_shared<TcpBinaryStream>(std::move(sock), ioc);
+    auto ws = std::weak_ptr<Session>(s);
+    s->stream_->start_server_side(
+        [ws](ClientCommand cmd) { if (auto s = ws.lock()) s->on_recv(std::move(cmd)); },
+        [ws](const std::string& e) { if (auto s = ws.lock()) s->on_error(e); });
+    s->user = std::make_shared<User>(0, "unauthenticated", Lang::EnUS, srv, ioc);
+    s->start_heartbeat();
+    return s;
 }
+void Session::try_send(const ServerCommand& cmd) { if (stream_) stream_->send(cmd); }
+uint8_t Session::version() const { return stream_ ? stream_->version() : 0; }
 
-void User::set_room(std::shared_ptr<Room> r) {
-    std::unique_lock lock(room_mtx);
-    room = std::move(r);
-}
-
-void User::clear_room() {
-    std::unique_lock lock(room_mtx);
-    room.reset();
-}
-
-// ══════════════════════════════════════════════════════════════════════
-// Session
-// ══════════════════════════════════════════════════════════════════════
-
-Session::Session(MpUuid sid, int fd, uint8_t ver, std::shared_ptr<ServerState> /*server*/)
-    : id(sid), version_(ver), socket_fd(fd)
-{
-    last_recv = std::chrono::steady_clock::now();
-}
-
-Session::~Session() {
-    stop();
-}
-
-void Session::try_send(ServerCommand cmd) {
-    send_queue.push(std::move(cmd));
-}
-
-void Session::stop() {
-    if (!alive.exchange(false)) return;
-    send_queue.close();
-    if (socket_fd >= 0) {
-        shutdown(socket_fd, SHUT_RDWR);
-        close(socket_fd);
-        socket_fd = -1;
-    }
-}
-
-void Session::update_last_recv() {
-    std::lock_guard<std::mutex> lock(last_recv_mtx);
-    last_recv = std::chrono::steady_clock::now();
-}
-
-// ── Send loop: serialize and write packets to socket ─────────────────
-void Session::send_loop() {
-    ServerCommand cmd;
-    std::vector<uint8_t> buf;
-    uint8_t len_buf[5];
-
-    while (alive.load()) {
-        if (!send_queue.pop(cmd, 200)) continue;
-
-        buf.clear();
-        BinaryWriter writer(buf);
-        cmd.write_binary(writer);
-
-        // ULEB128 length prefix
-        uint32_t len = (uint32_t)buf.size();
-        int n = 0;
-        uint32_t x = len;
-        do {
-            len_buf[n] = (uint8_t)(x & 0x7F);
-            x >>= 7;
-            if (x > 0) len_buf[n] |= 0x80;
-            n++;
-        } while (x > 0);
-
-        // Write length prefix + payload
-        int fd = socket_fd;
-        if (fd < 0) break;
-
-        auto write_all = [fd](const void* data, size_t sz) -> bool {
-            const uint8_t* p = (const uint8_t*)data;
-            size_t sent = 0;
-            while (sent < sz) {
-                ssize_t r = ::send(fd, p + sent, sz - sent, MSG_NOSIGNAL);
-                if (r <= 0) return false;
-                sent += (size_t)r;
-            }
-            return true;
-        };
-
-        if (!write_all(len_buf, n) || !write_all(buf.data(), buf.size())) {
-            std::cerr << "[session] send failed for " << id.str() << std::endl;
-            break;
-        }
-    }
-}
-
-// ── Recv loop: read packets, decode, and process commands ────────────
-void Session::recv_loop(std::shared_ptr<ServerState> server) {
-    int fd = socket_fd;
-    auto read_all = [&](void* data, size_t sz) -> bool {
-        uint8_t* p = (uint8_t*)data;
-        size_t got = 0;
-        while (got < sz) {
-            ssize_t r = ::recv(fd, p + got, sz - got, 0);
-            if (r <= 0) return false;
-            got += (size_t)r;
-        }
-        return true;
+void Session::start_heartbeat() {
+    hb_timer_ = std::make_shared<asio::steady_timer>(ioc_);
+    auto ws = std::weak_ptr<Session>(shared_from_this()); auto srv = server_; auto sid = id;
+    auto check = [ws, srv, sid](auto& self, const error_code& ec) {
+        if (ec) return; auto s = ws.lock(); if (!s) return;
+        auto now = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point last;
+        { std::lock_guard lk(s->last_recv_mu_); last = s->last_recv_; }
+        if (now - last > HEARTBEAT_DISCONNECT_TIMEOUT) { spdlog::warn("heartbeat timeout {}", sid.to_string()); srv->handle_lost_connection(sid); return; }
+        s->hb_timer_->expires_after(HEARTBEAT_DISCONNECT_TIMEOUT);
+        s->hb_timer_->async_wait([ws, srv, sid, &self](const error_code& ec) { self(self, ec); });
     };
+    hb_timer_->expires_after(HEARTBEAT_DISCONNECT_TIMEOUT);
+    hb_timer_->async_wait([check](const error_code& ec) { check(check, ec); });
+}
 
-    bool authenticated = false;
+void Session::on_recv(ClientCommand cmd) {
+    if (panicked_.load()) return;
+    { std::lock_guard lk(last_recv_mu_); last_recv_ = std::chrono::steady_clock::now(); }
+    if (cmd.type == ClientCommandType::Ping) { try_send(ServerCommand::make_pong()); return; }
+    if (waiting_auth_.load()) { handle_auth(cmd); return; }
+    LangContext::set(user->lang);
+    auto resp = process(cmd);
+    if (resp) try_send(*resp);
+}
+void Session::on_error(const std::string& e) {
+    spdlog::warn("session {} error: {}", id.to_string(), e);
+    server_->handle_lost_connection(id);
+}
 
-    while (alive.load()) {
-        // Read ULEB128 length
-        uint32_t len = 0;
-        int shift = 0;
-        while (true) {
-            uint8_t byte;
-            if (!read_all(&byte, 1)) goto disconnect;
-            len |= (uint32_t)(byte & 0x7F) << shift;
-            shift += 7;
-            if ((byte & 0x80) == 0) break;
-            if (shift > 32) goto disconnect;
-        }
-        if (len > 2 * 1024 * 1024) goto disconnect;
+// ── send_room_event helper ────────────────────────────────────────────
+static void send_re(std::shared_ptr<ServerState> srv, RoomEvent ev) {
+    if (auto rm = srv->get_room_monitor()) rm->try_send(ServerCommand::make_room_event(ev));
+}
 
-        // Read payload
-        std::vector<uint8_t> buf(len);
-        if (len > 0 && !read_all(buf.data(), len)) goto disconnect;
+// ── Send welcome messages and available rooms ─────────────────────────
+static void send_welcome(std::shared_ptr<User> u, std::shared_ptr<ServerState> srv) {
+    // Welcome messages
+    { Message m; m.type = MessageType::Chat; m.user = 0;
+      m.content = "欢迎使用HSNPhira多人游戏服务器！";
+      u->try_send(ServerCommand::make_message(m)); }
+    { Message m; m.type = MessageType::Chat; m.user = 0;
+      m.content = "欢迎加入1049578201交流群获取更多咨讯！";
+      u->try_send(ServerCommand::make_message(m)); }
 
-        update_last_recv();
-
-        // Decode
-        ClientCommand cmd;
-        try {
-            BinaryReader reader(buf);
-            cmd = ClientCommand::read_binary(reader);
-        } catch (const std::exception& e) {
-            std::cerr << "[session] invalid packet from " << id.str() << ": " << e.what() << std::endl;
-            goto disconnect;
-        }
-
-        // Handle Ping immediately
-        if (cmd.type == ClientCommandType::Ping) {
-            try_send(ServerCommand::pong());
-            continue;
-        }
-
-        // Handle authentication
-        if (!authenticated) {
-            if (cmd.type == ClientCommandType::Authenticate) {
-                handle_authenticate(cmd.token, server);
-                if (user) {
-                    authenticated = true;
-                } else {
-                    // Auth failed, session will be cleaned up
-                    goto disconnect;
-                }
-            } else {
-                std::cerr << "[session] packet before authentication, ignoring" << std::endl;
-            }
-            continue;
-        }
-
-        // Process authenticated commands
-        process_command(cmd);
+    // Show available rooms (unlocked, in SelectChart state)
+    std::vector<std::string> available;
+    { std::shared_lock lk(srv->rooms_mu);
+      for (auto& [name, room] : srv->rooms) {
+          if (room->is_locked()) continue;
+          std::shared_lock slk(room->state_mu);
+          if (room->state.type == InternalRoomState::Type::SelectChart)
+              available.push_back(name);
+      }
     }
-
-disconnect:
-    if (alive.load()) {
-        std::cerr << "[session] connection lost: " << id.str() << std::endl;
-        server->push_lost_connection(id);
+    if (!available.empty()) {
+        std::string list = "当前可加入的房间: ";
+        for (size_t i = 0; i < available.size(); i++) {
+            if (i > 0) list += ", ";
+            list += available[i];
+        }
+        Message m; m.type = MessageType::Chat; m.user = 0;
+        m.content = list;
+        u->try_send(ServerCommand::make_message(m));
+    } else {
+        Message m; m.type = MessageType::Chat; m.user = 0;
+        m.content = "当前没有可加入的房间，快创建一个吧！";
+        u->try_send(ServerCommand::make_message(m));
     }
 }
 
-// ── Heartbeat loop: check for disconnect timeout ─────────────────────
-void Session::heartbeat_loop(std::shared_ptr<ServerState> server) {
-    static constexpr auto DISCONNECT_TIMEOUT = std::chrono::seconds(10);
+// ── handle_auth ───────────────────────────────────────────────────────
+void Session::handle_auth(const ClientCommand& cmd) {
+    if (cmd.type == ClientCommandType::Authenticate || cmd.type == ClientCommandType::GameMonitorAuthenticate) {
+        auto self = shared_from_this();
+        auto srv  = server_;
+        auto sid  = id;
+        auto token = cmd.token;
+        auto cmd_type = cmd.type;
 
-    while (alive.load()) {
-        std::this_thread::sleep_for(std::chrono::seconds(3));
-        if (!alive.load()) break;
+        std::thread([self, srv, sid, token, cmd_type]() {
+            try {
+                auto r = authenticate_http(token);
+                asio::post(self->ioc_, [self, srv, sid, r, cmd_type]() {
+                    if (self->panicked_.load()) return;
 
-        std::chrono::steady_clock::time_point lr;
-        {
-            std::lock_guard<std::mutex> lock(last_recv_mtx);
-            lr = last_recv;
-        }
+                    // ── Ban check ──
+                    auto r2 = r;
+                    if (srv->is_banned(r2.id)) {
+                        spdlog::info("banned user {} tried to connect", r2.id);
+                        self->try_send(ServerCommand::make_auth_err("你已被管理员封禁，请加入交流群1049578201联系群主查看详情。"));
+                        self->panicked_.store(true);
+                        srv->handle_lost_connection(sid);
+                        return;
+                    }
 
-        if (std::chrono::steady_clock::now() - lr > DISCONNECT_TIMEOUT) {
-            std::cerr << "[session] heartbeat timeout: " << id.str() << std::endl;
-            server->push_lost_connection(id);
-            break;
-        }
-    }
+                    SessionCategory cat = SessionCategory::Normal;
+                    if (cmd_type == ClientCommandType::GameMonitorAuthenticate) {
+                        cat = SessionCategory::GameMonitor; r2.id = -r2.id; r2.name += " (monitor)";
+                    }
+                    self->category = cat;
+                    std::shared_ptr<User> up;
+                    { std::unique_lock lk(srv->users_mu);
+                      auto it = srv->users.find(r2.id);
+                      if (it != srv->users.end()) { spdlog::info("reconnect user {}", r2.id); up = it->second; }
+                      else { up = std::make_shared<User>(r2.id, r2.name, parse_language(r2.language), srv, self->ioc_); srv->users[r2.id] = up; }
+                    }
+                    self->user = up; up->set_session(self->weak_from_this());
+                    if (cat == SessionCategory::GameMonitor) srv->set_game_monitor(r2.id, self->weak_from_this());
+                    std::optional<ClientRoomState> rs;
+                    { std::shared_lock lk(up->room_mu); if (up->room) rs = up->room->client_state(*up); }
+                    self->try_send(ServerCommand::make_auth_ok(up->to_info(), rs));
+                    if (auto rm = srv->get_room_monitor()) rm->try_send(ServerCommand::make_user_visit(up->id));
+                    self->waiting_auth_.store(false);
+
+                    // ── Welcome messages + available rooms ──
+                    if (cat == SessionCategory::Normal) {
+                        send_welcome(up, srv);
+                    }
+                });
+            } catch (const std::exception& e) {
+                std::string err = e.what();
+                asio::post(self->ioc_, [self, srv, sid, err]() {
+                    spdlog::warn("auth fail: {}", err); self->try_send(ServerCommand::make_auth_err(err));
+                    self->panicked_.store(true); srv->handle_lost_connection(sid);
+                });
+            }
+        }).detach();
+
+    } else if (cmd.type == ClientCommandType::ConsoleAuthenticate) {
+        auto self = shared_from_this();
+        auto srv  = server_;
+        auto sid  = id;
+        auto token = cmd.token;
+
+        std::thread([self, srv, sid, token]() {
+            try {
+                auto r = authenticate_http(token);
+                asio::post(self->ioc_, [self, srv, r]() {
+                    if (self->panicked_.load()) return;
+                    self->category = SessionCategory::Console;
+                    auto up = std::make_shared<User>(r.id, r.name, parse_language(r.language), srv, self->ioc_);
+                    self->user = up; up->set_session(self->weak_from_this());
+                    self->try_send(ServerCommand::make_auth_ok(up->to_info(), std::nullopt));
+                    self->waiting_auth_.store(false);
+                });
+            } catch (const std::exception& e) {
+                std::string err = e.what();
+                asio::post(self->ioc_, [self, srv, sid, err]() {
+                    spdlog::warn("console auth fail: {}", err); self->try_send(ServerCommand::make_auth_err(err));
+                    self->panicked_.store(true); srv->handle_lost_connection(sid);
+                });
+            }
+        }).detach();
+
+    } else if (cmd.type == ClientCommandType::RoomMonitorAuthenticate) {
+        if (server_->get_room_monitor()) { try_send(ServerCommand::make_auth_err("more than one room monitor")); panicked_.store(true); server_->handle_lost_connection(id); }
+        else if (server_->room_monitor_key == cmd.key) {
+            spdlog::info("new room monitor connected"); category = SessionCategory::RoomMonitor;
+            auto up = std::make_shared<User>(-1, "$server_room_monitor", Lang::EnUS, server_, ioc_);
+            user = up; up->set_session(weak_from_this());
+            try_send(ServerCommand::make_auth_ok(up->to_info(), std::nullopt));
+            { std::unique_lock lk(server_->rm_mu); server_->room_monitor = weak_from_this(); }
+            waiting_auth_.store(false);
+        } else { try_send(ServerCommand::make_auth_err("secret key mismatch")); panicked_.store(true); server_->handle_lost_connection(id); }
+    } else { spdlog::warn("packet before auth, ignoring"); }
 }
 
-// ── Authentication handler ───────────────────────────────────────────
-void Session::handle_authenticate(const std::string& token, std::shared_ptr<ServerState> server) {
-
-    std::cerr << "[session] " << id.str() << ": authenticate " << token << std::endl;
-
-    // Fetch user info from API
-    std::string url = std::string(HOST_URL) + "/me";
-    auto resp = HttpClient::get(url, token);
-    if (!resp.ok()) {
-        std::cerr << "[session] failed to fetch user info: HTTP " << resp.status_code << std::endl;
-        try_send(ServerCommand::authenticate_err("failed to fetch info"));
-        return;
-    }
-
-    // Parse response
-    int32_t user_id;
-    std::string user_name, user_lang_str;
-    try {
-        user_id = SimpleJson::get_int(resp.body, "id");
-        user_name = SimpleJson::get_string(resp.body, "name");
-        user_lang_str = SimpleJson::get_string(resp.body, "language");
-    } catch (const std::exception& e) {
-        std::cerr << "[session] failed to parse user info: " << e.what() << std::endl;
-        try_send(ServerCommand::authenticate_err("failed to parse info"));
-        return;
-    }
-
-    Language lang(L10n::parse_language(user_lang_str));
-
-    std::cerr << "[session] " << id.str() << " <- id=" << user_id
-              << " name=" << user_name << " lang=" << user_lang_str << std::endl;
-
-    // Check if user is banned
-    if (BanManager::instance().is_banned(user_id)) {
-        std::cerr << "[session] user " << user_id << " is banned" << std::endl;
-        try_send(ServerCommand::authenticate_err("你已被封禁，无法连接服务器。如有疑问请联系管理员，QQ群：1049578201"));
-        return;
-    }
-
-    // Check if user already exists (reconnect)
-    {
-        std::unique_lock lock(server->users_mtx);
-        auto it = server->users.find(user_id);
-        if (it != server->users.end()) {
-            std::cerr << "[session] reconnect for user " << user_id << std::endl;
-            user = it->second;
-            user->set_session(weak_from_this());
-        } else {
-            user = std::make_shared<User>(user_id, user_name, lang, server);
-            user->set_session(weak_from_this());
-            server->users[user_id] = user;
-        }
-    }
-
-    // Build auth response
-    std::optional<ClientRoomState> room_state;
-    auto rm = user->get_room();
-    if (rm) {
-        room_state = rm->client_state(*user);
-    }
-    try_send(ServerCommand::authenticate_ok(user->to_info(), std::move(room_state)));
-
-    // Send welcome message with available rooms and QQ group
-    {
-        std::ostringstream welcome;
-        welcome << "欢迎来到 Phira 多人游戏服务器！\n";
-        welcome << "QQ群：1049578201\n";
-
-        // List available rooms (not Playing, not WaitingForReady)
-        std::vector<std::pair<std::string, int>> available_rooms;
-        {
-            std::shared_lock lock(server->rooms_mtx);
-            for (auto& [name, room] : server->rooms) {
-                std::shared_lock sl(room->state_mtx);
-                if (room->state.type == InternalRoomStateType::SelectChart && !room->is_locked()) {
-                    auto u = room->users();
-                    available_rooms.emplace_back(name, (int)u.size());
-                }
-            }
-        }
-
-        if (!available_rooms.empty()) {
-            welcome << "当前可加入的房间：\n";
-            for (auto& [name, count] : available_rooms) {
-                welcome << "  " << name << " (" << count << "/8)\n";
-            }
-        } else {
-            welcome << "当前暂无可加入的房间，你可以创建一个新房间。\n";
-        }
-
-        try_send(ServerCommand::msg(Message::chat(0, welcome.str())));
-    }
+// ── SSE emit helper for room events ──────────────────────────────────
+static void emit_room_sse(std::shared_ptr<ServerState> srv, const std::string& event_type, const nlohmann::json& data) {
+    srv->emit_sse(event_type, data.dump());
 }
 
-// ── Command processor (mirrors Rust's process function) ──────────────
-void Session::process_command(const ClientCommand& cmd) {
-    auto& lang = user->lang;
+// ── process (authenticated commands) ──────────────────────────────────
+std::optional<ServerCommand> Session::process(const ClientCommand& cmd) {
+    auto& u = user; auto srv = server_;
+    auto get_room = [&]() -> std::shared_ptr<Room> { std::shared_lock lk(u->room_mu); return u->room; };
 
     switch (cmd.type) {
-    case ClientCommandType::Ping:
-        // Already handled in recv_loop
-        break;
-
-    case ClientCommandType::Authenticate:
-        try_send(ServerCommand::authenticate_err("repeated authenticate"));
-        break;
+    case ClientCommandType::Ping: return std::nullopt;
+    case ClientCommandType::Authenticate: case ClientCommandType::ConsoleAuthenticate:
+    case ClientCommandType::RoomMonitorAuthenticate: case ClientCommandType::GameMonitorAuthenticate:
+        return ServerCommand::make_auth_err("repeated authenticate");
 
     case ClientCommandType::Chat: {
-        auto rm = user->get_room();
-        if (!rm) {
-            try_send(ServerCommand::simple_err(ServerCommandType::Chat, "no room"));
-            break;
-        }
-        rm->send_as(*user, cmd.message);
-        try_send(ServerCommand::simple_ok(ServerCommandType::Chat));
-        break;
+        auto rm = get_room(); if (!rm) return ServerCommand::make_err(ServerCommandType::Chat, "no room");
+        rm->send_as(*u, cmd.message); return ServerCommand::make_ok(ServerCommandType::Chat);
     }
-
     case ClientCommandType::Touches: {
-        auto rm = user->get_room();
-        if (!rm) break; // silently ignore
+        auto rm = get_room(); if (!rm) return std::nullopt;
         if (rm->is_live()) {
-            if (cmd.frames && !cmd.frames->empty()) {
-                float t = cmd.frames->back().time;
-                uint32_t bits;
-                memcpy(&bits, &t, sizeof(bits));
-                user->game_time.store(bits);
-            }
-            rm->broadcast_monitors(ServerCommand::touches(user->id, cmd.frames));
-
-            // WSS: broadcast touch frames as JSON
-            if (g_ws_server && cmd.frames && !cmd.frames->empty()) {
-                std::ostringstream oss;
-                oss << "[";
-                bool first = true;
-                for (auto& frame : *cmd.frames) {
-                    if (!first) oss << ",";
-                    first = false;
-                    oss << "{\"time\":" << frame.time << ",\"points\":[";
-                    bool pfirst = true;
-                    for (auto& [id, pos] : frame.points) {
-                        if (!pfirst) oss << ",";
-                        pfirst = false;
-                        oss << "{\"id\":" << (int)id
-                            << ",\"x\":" << pos.x()
-                            << ",\"y\":" << pos.y() << "}";
-                    }
-                    oss << "]}";
-                }
-                oss << "]";
-                g_ws_server->broadcast_touches(rm->id.to_string(), user->id, oss.str());
-            }
+            if (!cmd.frames.empty()) { uint32_t b; float t = cmd.frames.back().time; std::memcpy(&b, &t, 4); u->game_time.store(b, std::memory_order_seq_cst); }
+            rm->broadcast_monitors(ServerCommand::make_touches(u->id, cmd.frames));
         }
-        // No response for touches
-        break;
+        return std::nullopt;
     }
-
     case ClientCommandType::Judges: {
-        auto rm = user->get_room();
-        if (!rm) break;
-        if (rm->is_live()) {
-            rm->broadcast_monitors(ServerCommand::judges_cmd(user->id, cmd.judges));
-
-            // WSS: broadcast judge events as JSON
-            if (g_ws_server && cmd.judges && !cmd.judges->empty()) {
-                std::ostringstream oss;
-                oss << "[";
-                bool first = true;
-                for (auto& je : *cmd.judges) {
-                    if (!first) oss << ",";
-                    first = false;
-                    std::string jname;
-                    switch (je.judgement) {
-                        case Judgement::Perfect:     jname = "Perfect"; break;
-                        case Judgement::Good:        jname = "Good"; break;
-                        case Judgement::Bad:         jname = "Bad"; break;
-                        case Judgement::Miss:        jname = "Miss"; break;
-                        case Judgement::HoldPerfect: jname = "HoldPerfect"; break;
-                        case Judgement::HoldGood:    jname = "HoldGood"; break;
-                    }
-                    oss << "{\"time\":" << je.time
-                        << ",\"line_id\":" << je.line_id
-                        << ",\"note_id\":" << je.note_id
-                        << ",\"judgement\":\"" << jname << "\"}";
-                }
-                oss << "]";
-                g_ws_server->broadcast_judges(rm->id.to_string(), user->id, oss.str());
-            }
-        }
-        break;
+        auto rm = get_room(); if (!rm) return std::nullopt;
+        if (rm->is_live()) rm->broadcast_monitors(ServerCommand::make_judges(u->id, cmd.judges));
+        return std::nullopt;
     }
-
     case ClientCommandType::CreateRoom: {
-        auto existing_room = user->get_room();
-        if (existing_room) {
-            try_send(ServerCommand::simple_err(ServerCommandType::CreateRoom, "already in room"));
-            break;
+        if (category != SessionCategory::Normal) return ServerCommand::make_err(ServerCommandType::CreateRoom, "invalid session");
+        { std::shared_lock lk(u->room_mu); if (u->room) return ServerCommand::make_err(ServerCommandType::CreateRoom, "already in room"); }
+        auto rm = std::make_shared<Room>(cmd.room_id, std::weak_ptr<User>(u));
+        { std::unique_lock lk(srv->rooms_mu);
+          if (srv->rooms.count(cmd.room_id.to_string())) return ServerCommand::make_err(ServerCommandType::CreateRoom, TL("create-id-occupied"));
+          srv->rooms[cmd.room_id.to_string()] = rm;
+        }
+        { Message m; m.type = MessageType::CreateRoom; m.user = u->id; rm->send_msg(m); }
+        { RoomEvent ev; ev.type = RoomEventType::CreateRoom; ev.room = cmd.room_id; ev.data = rm->into_data(); send_re(srv, ev); }
+        { std::unique_lock lk(u->room_mu); u->room = rm; }
+        spdlog::info("user {} create room {}", u->id, cmd.room_id.to_string());
+
+        // SSE: create_room event
+        { nlohmann::json data;
+          data["host"] = u->id;
+          data["users"] = nlohmann::json::array({u->id});
+          data["lock"] = false; data["cycle"] = false;
+          data["chart"] = nullptr; data["state"] = "SELECTING_CHART";
+          data["playing_users"] = nlohmann::json::array();
+          data["rounds"] = nlohmann::json::array();
+          emit_room_sse(srv, "create_room", {{"room", cmd.room_id.to_string()}, {"data", data}});
         }
 
-        auto& rid = cmd.room_id;
-        {
-            std::unique_lock lock(user->server->rooms_mtx);
-            if (user->server->rooms.count(rid.to_string())) {
-                try_send(ServerCommand::simple_err(ServerCommandType::CreateRoom,
-                                                    tl(lang, "create-id-occupied")));
-                break;
-            }
-            auto new_room = std::make_shared<Room>(rid, std::weak_ptr<User>(user));
-            user->server->rooms[rid.to_string()] = new_room;
-            new_room->send(Message::create_room(user->id));
-            user->set_room(new_room);
-        }
-        std::cerr << "[session] user " << user->id << " create room " << rid.to_string() << std::endl;
-        try_send(ServerCommand::simple_ok(ServerCommandType::CreateRoom));
-        // SSE: create_room
-        if (g_web_server) {
-            std::ostringstream oss;
-            oss << "{\"room\":\"" << rid.to_string() << "\",\"data\":{"
-                << "\"host\":" << user->id
-                << ",\"users\":[" << user->id << "]"
-                << ",\"lock\":false,\"cycle\":false,\"chart\":null"
-                << ",\"state\":\"SELECTING_CHART\",\"playing_users\":[],\"rounds\":[]}}";
-            g_web_server->broadcast_sse("create_room", oss.str());
-        }
-        break;
+        return ServerCommand::make_ok(ServerCommandType::CreateRoom);
     }
-
     case ClientCommandType::JoinRoom: {
-        auto existing_room = user->get_room();
-        if (existing_room) {
-            try_send(ServerCommand::join_room_err("already in room"));
-            break;
-        }
-        std::shared_ptr<Room> target_room;
-        {
-            std::shared_lock lock(user->server->rooms_mtx);
-            auto it = user->server->rooms.find(cmd.room_id.to_string());
-            if (it != user->server->rooms.end()) target_room = it->second;
-        }
-        if (!target_room) {
-            try_send(ServerCommand::join_room_err("room not found"));
-            break;
-        }
-        if (target_room->is_locked()) {
-            try_send(ServerCommand::join_room_err(tl(lang, "join-room-locked")));
-            break;
-        }
-        {
-            std::shared_lock sl(target_room->state_mtx);
-            if (target_room->state.type != InternalRoomStateType::SelectChart) {
-                try_send(ServerCommand::join_room_err(tl(lang, "join-game-ongoing")));
-                break;
-            }
-        }
-        bool wants_monitor = cmd.monitor;
-        if (wants_monitor && !user->can_monitor()) {
-            try_send(ServerCommand::join_room_err(tl(lang, "join-cant-monitor")));
-            break;
-        }
-        if (!target_room->add_user(std::weak_ptr<User>(user), wants_monitor)) {
-            try_send(ServerCommand::join_room_err(tl(lang, "join-room-full")));
-            break;
-        }
-        std::cerr << "[session] user " << user->id << " join room "
-                  << cmd.room_id.to_string() << " monitor=" << wants_monitor << std::endl;
-        user->monitor.store(wants_monitor);
-        if (wants_monitor) {
-            bool was_live = target_room->live.exchange(true);
-            if (!was_live) {
-                std::cerr << "[session] room " << cmd.room_id.to_string() << " goes live" << std::endl;
-            }
-        }
-        target_room->broadcast(ServerCommand::on_join_room(user->to_info()));
-        target_room->send(Message::join_room(user->id, user->name));
-        user->set_room(target_room);
+        if (category != SessionCategory::Normal && category != SessionCategory::GameMonitor) return ServerCommand::make_err(ServerCommandType::JoinRoom, "invalid session");
+        if (!cmd.monitor && category == SessionCategory::GameMonitor) return ServerCommand::make_err(ServerCommandType::JoinRoom, "monitor=false in game monitor");
+        { std::shared_lock lk(u->room_mu); if (u->room) return ServerCommand::make_err(ServerCommandType::JoinRoom, "already in room"); }
+        std::shared_ptr<Room> rm;
+        { std::shared_lock lk(srv->rooms_mu); auto it = srv->rooms.find(cmd.room_id.to_string()); if (it == srv->rooms.end()) return ServerCommand::make_err(ServerCommandType::JoinRoom, "room not found"); rm = it->second; }
+        if (rm->is_locked()) return ServerCommand::make_err(ServerCommandType::JoinRoom, TL("join-room-locked"));
+        { std::shared_lock lk(rm->state_mu); if (rm->state.type != InternalRoomState::Type::SelectChart) return ServerCommand::make_err(ServerCommandType::JoinRoom, TL("join-game-ongoing")); }
+        if (cmd.monitor && category != SessionCategory::GameMonitor) return ServerCommand::make_err(ServerCommandType::JoinRoom, TL("join-cant-monitor"));
+        if (!rm->add_user(std::weak_ptr<User>(u), cmd.monitor)) return ServerCommand::make_err(ServerCommandType::JoinRoom, TL("join-room-full"));
+        u->monitor.store(cmd.monitor, std::memory_order_seq_cst);
+        if (cmd.monitor && !rm->is_live()) { rm->set_live(true); spdlog::info("room {} goes live", cmd.room_id.to_string()); }
+        rm->broadcast(ServerCommand::make_on_join(u->to_info()));
+        { Message m; m.type = MessageType::JoinRoom; m.user = u->id; m.name = u->name; rm->send_msg(m); }
+        if (!cmd.monitor) { RoomEvent ev; ev.type = RoomEventType::JoinRoom; ev.room = cmd.room_id; ev.user_id = u->id; send_re(srv, ev); }
+        { std::unique_lock lk(u->room_mu); u->room = rm; }
+        JoinRoomResponse resp; resp.state = rm->client_room_state();
+        for (auto& p : rm->get_users()) resp.users.push_back(p->to_info());
+        for (auto& p : rm->get_monitors()) resp.users.push_back(p->to_info());
+        resp.live = rm->is_live();
 
-        // Build join response
-        JoinRoomResponse jr;
-        jr.state = target_room->client_room_state();
-        auto u = target_room->users();
-        auto m = target_room->monitors();
-        for (auto& usr : u) jr.users.push_back(usr->to_info());
-        for (auto& usr : m) jr.users.push_back(usr->to_info());
-        jr.live = target_room->is_live();
-        try_send(ServerCommand::join_room_ok(std::move(jr)));
-        // SSE: join_room
-        if (g_web_server) {
-            g_web_server->broadcast_sse("join_room",
-                "{\"room\":\"" + cmd.room_id.to_string() + "\",\"user\":" + std::to_string(user->id) + "}");
-        }
-        break;
+        // SSE: join_room event
+        if (!cmd.monitor) emit_room_sse(srv, "join_room", {{"room", cmd.room_id.to_string()}, {"user", u->id}});
+
+        return ServerCommand::make_join_ok(resp);
     }
-
     case ClientCommandType::LeaveRoom: {
-        auto rm = user->get_room();
-        if (!rm) {
-            try_send(ServerCommand::simple_err(ServerCommandType::LeaveRoom, "no room"));
-            break;
-        }
-        std::cerr << "[session] user " << user->id << " leave room " << rm->id.to_string() << std::endl;
-        user->clear_room();
-        // SSE: leave_room
-        if (g_web_server) {
-            g_web_server->broadcast_sse("leave_room",
-                "{\"room\":\"" + rm->id.to_string() + "\",\"user\":" + std::to_string(user->id) + "}");
-        }
-        if (rm->on_user_leave(*user)) {
-            std::unique_lock lock(user->server->rooms_mtx);
-            user->server->rooms.erase(rm->id.to_string());
-        }
-        try_send(ServerCommand::simple_ok(ServerCommandType::LeaveRoom));
-        break;
-    }
+        if (category != SessionCategory::Normal && category != SessionCategory::GameMonitor) return ServerCommand::make_err(ServerCommandType::LeaveRoom, "invalid session");
+        auto rm = get_room(); if (!rm) return ServerCommand::make_err(ServerCommandType::LeaveRoom, "no room");
+        spdlog::info("user {} leave room {}", u->id, rm->id.to_string());
+        auto room_name = rm->id.to_string();
+        if (rm->on_user_leave(*u)) { std::unique_lock lk(srv->rooms_mu); srv->rooms.erase(room_name); }
+        { RoomEvent ev; ev.type = RoomEventType::LeaveRoom; ev.room = rm->id; ev.user_id = u->id; send_re(srv, ev); }
 
+        // SSE: leave_room event
+        emit_room_sse(srv, "leave_room", {{"room", room_name}, {"user", u->id}});
+
+        return ServerCommand::make_ok(ServerCommandType::LeaveRoom);
+    }
     case ClientCommandType::LockRoom: {
-        auto rm = user->get_room();
-        if (!rm) {
-            try_send(ServerCommand::simple_err(ServerCommandType::LockRoom, "no room"));
-            break;
-        }
-        if (!rm->check_host(*user)) {
-            try_send(ServerCommand::simple_err(ServerCommandType::LockRoom, "only host can do this"));
-            break;
-        }
-        std::cerr << "[session] user " << user->id << " lock room " << rm->id.to_string()
-                  << " lock=" << cmd.flag << std::endl;
-        rm->locked.store(cmd.flag);
-        rm->send(Message::lock_room(cmd.flag));
-        rm->on_state_change();  // FIX: fire SSE update_room event
-        try_send(ServerCommand::simple_ok(ServerCommandType::LockRoom));
-        break;
+        if (category != SessionCategory::Normal) return ServerCommand::make_err(ServerCommandType::LockRoom, "invalid session");
+        auto rm = get_room(); if (!rm) return ServerCommand::make_err(ServerCommandType::LockRoom, "no room");
+        try { rm->check_host_throw(*u); } catch (...) { return ServerCommand::make_err(ServerCommandType::LockRoom, "only host"); }
+        rm->set_locked(cmd.lock_val);
+        { Message m; m.type = MessageType::LockRoom; m.lock_val = cmd.lock_val; rm->send_msg(m); }
+        { PartialRoomData pd; pd.lock = cmd.lock_val; RoomEvent ev; ev.type = RoomEventType::UpdateRoom; ev.room = rm->id; ev.partial = pd; send_re(srv, ev); }
+        // SSE
+        emit_room_sse(srv, "update_room", {{"room", rm->id.to_string()}, {"data", {{"lock", cmd.lock_val}}}});
+        return ServerCommand::make_ok(ServerCommandType::LockRoom);
     }
-
     case ClientCommandType::CycleRoom: {
-        auto rm = user->get_room();
-        if (!rm) {
-            try_send(ServerCommand::simple_err(ServerCommandType::CycleRoom, "no room"));
-            break;
-        }
-        if (!rm->check_host(*user)) {
-            try_send(ServerCommand::simple_err(ServerCommandType::CycleRoom, "only host can do this"));
-            break;
-        }
-        std::cerr << "[session] user " << user->id << " cycle room " << rm->id.to_string()
-                  << " cycle=" << cmd.flag << std::endl;
-        rm->cycle.store(cmd.flag);
-        rm->send(Message::cycle_room(cmd.flag));
-        rm->on_state_change();  // FIX: fire SSE update_room event
-        try_send(ServerCommand::simple_ok(ServerCommandType::CycleRoom));
-        break;
+        if (category != SessionCategory::Normal) return ServerCommand::make_err(ServerCommandType::CycleRoom, "invalid session");
+        auto rm = get_room(); if (!rm) return ServerCommand::make_err(ServerCommandType::CycleRoom, "no room");
+        try { rm->check_host_throw(*u); } catch (...) { return ServerCommand::make_err(ServerCommandType::CycleRoom, "only host"); }
+        rm->set_cycle(cmd.cycle_val);
+        { Message m; m.type = MessageType::CycleRoom; m.cycle_val = cmd.cycle_val; rm->send_msg(m); }
+        { PartialRoomData pd; pd.cycle = cmd.cycle_val; RoomEvent ev; ev.type = RoomEventType::UpdateRoom; ev.room = rm->id; ev.partial = pd; send_re(srv, ev); }
+        emit_room_sse(srv, "update_room", {{"room", rm->id.to_string()}, {"data", {{"cycle", cmd.cycle_val}}}});
+        return ServerCommand::make_ok(ServerCommandType::CycleRoom);
     }
-
     case ClientCommandType::SelectChart: {
-        auto rm = user->get_room();
-        if (!rm) {
-            try_send(ServerCommand::simple_err(ServerCommandType::SelectChart, "no room"));
-            break;
-        }
-        {
-            std::shared_lock sl(rm->state_mtx);
-            if (rm->state.type != InternalRoomStateType::SelectChart) {
-                try_send(ServerCommand::simple_err(ServerCommandType::SelectChart, "invalid state"));
-                break;
-            }
-        }
-        if (!rm->check_host(*user)) {
-            try_send(ServerCommand::simple_err(ServerCommandType::SelectChart, "only host can do this"));
-            break;
-        }
-
-        // Fetch chart info from API
-        std::string url = std::string(HOST_URL) + "/chart/" + std::to_string(cmd.chart_id);
-        auto resp = HttpClient::get(url);
-        if (!resp.ok()) {
-            try_send(ServerCommand::simple_err(ServerCommandType::SelectChart,
-                                                "failed to fetch chart"));
-            break;
-        }
-
-        Chart chart_info;
+        if (category != SessionCategory::Normal) return ServerCommand::make_err(ServerCommandType::SelectChart, "invalid session");
+        auto rm = get_room(); if (!rm) return ServerCommand::make_err(ServerCommandType::SelectChart, "no room");
+        { std::shared_lock lk(rm->state_mu); if (rm->state.type != InternalRoomState::Type::SelectChart) return ServerCommand::make_err(ServerCommandType::SelectChart, "invalid state"); }
+        try { rm->check_host_throw(*u); } catch (...) { return ServerCommand::make_err(ServerCommandType::SelectChart, "only host"); }
         try {
-            chart_info.id = SimpleJson::get_int(resp.body, "id");
-            chart_info.name = SimpleJson::get_string(resp.body, "name");
-        } catch (const std::exception& e) {
-            try_send(ServerCommand::simple_err(ServerCommandType::SelectChart,
-                                                "failed to parse chart info"));
-            break;
-        }
-
-        rm->send(Message::select_chart(user->id, chart_info.name, chart_info.id));
-        {
-            std::unique_lock cl(rm->chart_mtx);
-            rm->chart = chart_info;
-        }
-        rm->on_state_change();
-        try_send(ServerCommand::simple_ok(ServerCommandType::SelectChart));
-        break;
+            auto body = http_get(PHIRA_HOST + "/chart/" + std::to_string(cmd.chart_id));
+            auto j = nlohmann::json::parse(body); ChartInfo ci; ci.id = j.at("id").get<int32_t>(); ci.name = j.at("name").get<std::string>();
+            { Message m; m.type = MessageType::SelectChart; m.user = u->id; m.name = ci.name; m.chart_id = ci.id; rm->send_msg(m); }
+            { std::unique_lock lk(rm->chart_mu); rm->chart = ci; }
+            rm->on_state_change();
+            { PartialRoomData pd; pd.chart = cmd.chart_id; RoomEvent ev; ev.type = RoomEventType::UpdateRoom; ev.room = rm->id; ev.partial = pd; send_re(srv, ev); }
+            emit_room_sse(srv, "update_room", {{"room", rm->id.to_string()}, {"data", {{"chart", cmd.chart_id}}}});
+            return ServerCommand::make_ok(ServerCommandType::SelectChart);
+        } catch (const std::exception& e) { return ServerCommand::make_err(ServerCommandType::SelectChart, e.what()); }
     }
-
     case ClientCommandType::RequestStart: {
-        auto rm = user->get_room();
-        if (!rm) {
-            try_send(ServerCommand::simple_err(ServerCommandType::RequestStart, "no room"));
-            break;
-        }
-        {
-            std::shared_lock sl(rm->state_mtx);
-            if (rm->state.type != InternalRoomStateType::SelectChart) {
-                try_send(ServerCommand::simple_err(ServerCommandType::RequestStart, "invalid state"));
-                break;
-            }
-        }
-        if (!rm->check_host(*user)) {
-            try_send(ServerCommand::simple_err(ServerCommandType::RequestStart, "only host can do this"));
-            break;
-        }
-        {
-            std::shared_lock cl(rm->chart_mtx);
-            if (!rm->chart) {
-                try_send(ServerCommand::simple_err(ServerCommandType::RequestStart,
-                                                    tl(lang, "start-no-chart-selected")));
-                break;
-            }
-        }
-        std::cerr << "[session] room " << rm->id.to_string() << " wait for ready" << std::endl;
+        if (category != SessionCategory::Normal) return ServerCommand::make_err(ServerCommandType::RequestStart, "invalid session");
+        auto rm = get_room(); if (!rm) return ServerCommand::make_err(ServerCommandType::RequestStart, "no room");
+        { std::shared_lock lk(rm->state_mu); if (rm->state.type != InternalRoomState::Type::SelectChart) return ServerCommand::make_err(ServerCommandType::RequestStart, "invalid state"); }
+        try { rm->check_host_throw(*u); } catch (...) { return ServerCommand::make_err(ServerCommandType::RequestStart, "only host"); }
+        { std::shared_lock lk(rm->chart_mu); if (!rm->chart) return ServerCommand::make_err(ServerCommandType::RequestStart, TL("start-no-chart-selected")); }
         rm->reset_game_time();
-        rm->send(Message::game_start(user->id));
-        {
-            std::unique_lock sl(rm->state_mtx);
-            std::set<int32_t> started;
-            started.insert(user->id);
-            rm->state = InternalRoomState::wait_for_ready(std::move(started));
-        }
-        rm->on_state_change();
-        rm->check_all_ready();
-        try_send(ServerCommand::simple_ok(ServerCommandType::RequestStart));
-        break;
+        { Message m; m.type = MessageType::GameStart; m.user = u->id; rm->send_msg(m); }
+        { std::unique_lock lk(rm->state_mu); rm->state.type = InternalRoomState::Type::WaitForReady; rm->state.started.clear(); rm->state.started.insert(u->id); }
+        rm->on_state_change(); rm->check_all_ready();
+        { std::shared_lock lk(rm->state_mu); PartialRoomData pd; pd.state = rm->state.to_stripped(); RoomEvent ev; ev.type = RoomEventType::UpdateRoom; ev.room = rm->id; ev.partial = pd; send_re(srv, ev); }
+        emit_room_sse(srv, "update_room", {{"room", rm->id.to_string()}, {"data", {{"state", "WAITING_FOR_READY"}}}});
+        emit_room_sse(srv, "start_round", {{"room", rm->id.to_string()}});
+        return ServerCommand::make_ok(ServerCommandType::RequestStart);
     }
-
     case ClientCommandType::Ready: {
-        auto rm = user->get_room();
-        if (!rm) {
-            try_send(ServerCommand::simple_err(ServerCommandType::Ready, "no room"));
-            break;
+        if (category != SessionCategory::Normal && category != SessionCategory::GameMonitor) return ServerCommand::make_err(ServerCommandType::Ready, "invalid session");
+        auto rm = get_room(); if (!rm) return ServerCommand::make_err(ServerCommandType::Ready, "no room");
+        { std::unique_lock lk(rm->state_mu);
+          if (rm->state.type == InternalRoomState::Type::WaitForReady) {
+              if (!rm->state.started.insert(u->id).second) return ServerCommand::make_err(ServerCommandType::Ready, "already ready");
+          }
         }
-        {
-            std::unique_lock sl(rm->state_mtx);
-            if (rm->state.type == InternalRoomStateType::WaitForReady) {
-                if (!rm->state.started.insert(user->id).second) {
-                    try_send(ServerCommand::simple_err(ServerCommandType::Ready, "already ready"));
-                    break;
-                }
-            } else {
-                try_send(ServerCommand::simple_ok(ServerCommandType::Ready));
-                break;
-            }
-        }
-        rm->send(Message::ready(user->id));
+        { Message m; m.type = MessageType::Ready; m.user = u->id; rm->send_msg(m); }
         rm->check_all_ready();
-        try_send(ServerCommand::simple_ok(ServerCommandType::Ready));
-        break;
+        { std::shared_lock lk(rm->state_mu);
+          if (rm->state.type == InternalRoomState::Type::Playing) {
+              PartialRoomData pd; pd.state = StrippedRoomState::Playing; RoomEvent ev; ev.type = RoomEventType::UpdateRoom; ev.room = rm->id; ev.partial = pd; send_re(srv, ev);
+              emit_room_sse(srv, "update_room", {{"room", rm->id.to_string()}, {"data", {{"state", "PLAYING"}}}});
+          }
+        }
+        return ServerCommand::make_ok(ServerCommandType::Ready);
     }
-
     case ClientCommandType::CancelReady: {
-        auto rm = user->get_room();
-        if (!rm) {
-            try_send(ServerCommand::simple_err(ServerCommandType::CancelReady, "no room"));
-            break;
+        if (category != SessionCategory::Normal) return ServerCommand::make_err(ServerCommandType::CancelReady, "invalid session");
+        auto rm = get_room(); if (!rm) return ServerCommand::make_err(ServerCommandType::CancelReady, "no room");
+        { std::unique_lock lk(rm->state_mu);
+          if (rm->state.type == InternalRoomState::Type::WaitForReady) {
+              if (!rm->state.started.erase(u->id)) return ServerCommand::make_err(ServerCommandType::CancelReady, "not ready");
+              bool is_host = false; try { rm->check_host_throw(*u); is_host = true; } catch (...) {}
+              if (is_host) { Message m; m.type = MessageType::CancelGame; m.user = u->id; rm->send_msg(m);
+                  rm->state.type = InternalRoomState::Type::SelectChart; rm->state.started.clear();
+                  lk.unlock(); rm->on_state_change();
+                  emit_room_sse(srv, "update_room", {{"room", rm->id.to_string()}, {"data", {{"state", "SELECTING_CHART"}}}});
+              } else { Message m; m.type = MessageType::CancelReady; m.user = u->id; rm->send_msg(m); }
+          }
         }
-        {
-            std::unique_lock sl(rm->state_mtx);
-            if (rm->state.type == InternalRoomStateType::WaitForReady) {
-                if (rm->state.started.erase(user->id) == 0) {
-                    try_send(ServerCommand::simple_err(ServerCommandType::CancelReady, "not ready"));
-                    break;
-                }
-                if (rm->check_host(*user)) {
-                    // Host cancels → cancel the whole game
-                    rm->send(Message::cancel_game(user->id));
-                    rm->state = InternalRoomState::select_chart();
-                    sl.unlock();
-                    rm->on_state_change();
-                } else {
-                    rm->send(Message::cancel_ready(user->id));
-                }
-            }
-        }
-        try_send(ServerCommand::simple_ok(ServerCommandType::CancelReady));
-        break;
+        return ServerCommand::make_ok(ServerCommandType::CancelReady);
     }
-
     case ClientCommandType::Played: {
-        auto rm = user->get_room();
-        if (!rm) {
-            try_send(ServerCommand::simple_err(ServerCommandType::Played, "no room"));
-            break;
-        }
-
-        // Fetch record from API
-        std::string url = std::string(HOST_URL) + "/record/" + std::to_string(cmd.chart_id);
-        auto resp = HttpClient::get(url);
-        if (!resp.ok()) {
-            try_send(ServerCommand::simple_err(ServerCommandType::Played, "failed to fetch record"));
-            break;
-        }
-
-        Record rec;
+        if (category != SessionCategory::Normal) return ServerCommand::make_err(ServerCommandType::Played, "invalid session");
+        auto rm = get_room(); if (!rm) return ServerCommand::make_err(ServerCommandType::Played, "no room");
         try {
-            rec.id = SimpleJson::get_int(resp.body, "id");
-            rec.player = SimpleJson::get_int(resp.body, "player");
-            rec.score = SimpleJson::get_int(resp.body, "score");
-            rec.perfect = SimpleJson::get_int(resp.body, "perfect");
-            rec.good = SimpleJson::get_int(resp.body, "good");
-            rec.bad = SimpleJson::get_int(resp.body, "bad");
-            rec.miss = SimpleJson::get_int(resp.body, "miss");
-            rec.max_combo = SimpleJson::get_int(resp.body, "max_combo");
-            rec.accuracy = SimpleJson::get_float(resp.body, "accuracy");
-            rec.full_combo = SimpleJson::get_bool(resp.body, "full_combo");
-            rec.std_dev = SimpleJson::get_float(resp.body, "std");
-            rec.std_score = SimpleJson::get_float(resp.body, "std_score");
-        } catch (const std::exception& e) {
-            try_send(ServerCommand::simple_err(ServerCommandType::Played, "failed to parse record"));
-            break;
-        }
-
-        if (rec.player != user->id) {
-            try_send(ServerCommand::simple_err(ServerCommandType::Played, "invalid record"));
-            break;
-        }
-
-        rm->send(Message::played(user->id, rec.score, rec.accuracy, rec.full_combo));
-
-        {
-            std::unique_lock sl(rm->state_mtx);
-            if (rm->state.type == InternalRoomStateType::Playing) {
-                if (rm->state.aborted.count(user->id)) {
-                    try_send(ServerCommand::simple_err(ServerCommandType::Played, "aborted"));
-                    break;
-                }
-                if (rm->state.results.count(user->id)) {
-                    try_send(ServerCommand::simple_err(ServerCommandType::Played, "already uploaded"));
-                    break;
-                }
-                rm->state.results[user->id] = rec;
+            auto body = http_get(PHIRA_HOST + "/record/" + std::to_string(cmd.chart_id));
+            Record rec = Record::from_json(body);
+            if (rec.player != u->id) return ServerCommand::make_err(ServerCommandType::Played, "invalid record");
+            { Message m; m.type = MessageType::Played; m.user = u->id; m.score_val = rec.score; m.accuracy = rec.accuracy; m.full_combo = rec.full_combo; rm->send_msg(m); }
+            { std::unique_lock lk(rm->state_mu);
+              if (rm->state.type == InternalRoomState::Type::Playing) {
+                  if (rm->state.aborted.count(u->id)) return ServerCommand::make_err(ServerCommandType::Played, "aborted");
+                  if (rm->state.results.count(u->id)) return ServerCommand::make_err(ServerCommandType::Played, "already uploaded");
+                  rm->state.results[u->id] = rec;
+              }
             }
-        }
-        rm->check_all_ready();
-        try_send(ServerCommand::simple_ok(ServerCommandType::Played));
-        break;
-    }
 
+            // SSE: player_score
+            emit_room_sse(srv, "player_score", {{"room", rm->id.to_string()}, {"record", {
+                {"id", rec.id}, {"player", rec.player}, {"score", rec.score},
+                {"perfect", rec.perfect}, {"good", rec.good}, {"bad", rec.bad},
+                {"miss", rec.miss}, {"max_combo", rec.max_combo},
+                {"accuracy", rec.accuracy}, {"full_combo", rec.full_combo},
+                {"std", rec.std_val}, {"std_score", rec.std_score}
+            }}});
+
+            rm->check_all_ready();
+            { std::shared_lock lk(rm->state_mu);
+              if (rm->state.type == InternalRoomState::Type::SelectChart) {
+                  { std::shared_lock rl(rm->rounds_mu); if (!rm->rounds.empty()) { RoomEvent ev; ev.type = RoomEventType::NewRound; ev.room = rm->id; ev.round = rm->rounds.back(); send_re(srv, ev); } }
+                  PartialRoomData pd; pd.state = StrippedRoomState::SelectingChart; RoomEvent ev; ev.type = RoomEventType::UpdateRoom; ev.room = rm->id; ev.partial = pd; send_re(srv, ev);
+                  emit_room_sse(srv, "update_room", {{"room", rm->id.to_string()}, {"data", {{"state", "SELECTING_CHART"}}}});
+              }
+            }
+            return ServerCommand::make_ok(ServerCommandType::Played);
+        } catch (const std::exception& e) { return ServerCommand::make_err(ServerCommandType::Played, e.what()); }
+    }
     case ClientCommandType::Abort: {
-        auto rm = user->get_room();
-        if (!rm) {
-            try_send(ServerCommand::simple_err(ServerCommandType::Abort, "no room"));
-            break;
+        if (category != SessionCategory::Normal) return ServerCommand::make_err(ServerCommandType::Abort, "invalid session");
+        auto rm = get_room(); if (!rm) return ServerCommand::make_err(ServerCommandType::Abort, "no room");
+        { std::unique_lock lk(rm->state_mu);
+          if (rm->state.type == InternalRoomState::Type::Playing) {
+              if (rm->state.results.count(u->id)) return ServerCommand::make_err(ServerCommandType::Abort, "already uploaded");
+              if (!rm->state.aborted.insert(u->id).second) return ServerCommand::make_err(ServerCommandType::Abort, "aborted");
+          }
         }
-        {
-            std::unique_lock sl(rm->state_mtx);
-            if (rm->state.type == InternalRoomStateType::Playing) {
-                if (rm->state.results.count(user->id)) {
-                    try_send(ServerCommand::simple_err(ServerCommandType::Abort, "already uploaded"));
-                    break;
-                }
-                if (!rm->state.aborted.insert(user->id).second) {
-                    try_send(ServerCommand::simple_err(ServerCommandType::Abort, "aborted"));
-                    break;
-                }
-            }
-        }
-        rm->send(Message::abort_msg(user->id));
+        { Message m; m.type = MessageType::Abort; m.user = u->id; rm->send_msg(m); }
         rm->check_all_ready();
-        try_send(ServerCommand::simple_ok(ServerCommandType::Abort));
-        break;
+        { std::shared_lock lk(rm->state_mu);
+          if (rm->state.type == InternalRoomState::Type::SelectChart) {
+              PartialRoomData pd; pd.state = StrippedRoomState::SelectingChart; RoomEvent ev; ev.type = RoomEventType::UpdateRoom; ev.room = rm->id; ev.partial = pd; send_re(srv, ev);
+              emit_room_sse(srv, "update_room", {{"room", rm->id.to_string()}, {"data", {{"state", "SELECTING_CHART"}}}});
+          }
+        }
+        return ServerCommand::make_ok(ServerCommandType::Abort);
     }
+    case ClientCommandType::QueryRoomInfo: {
+        if (category != SessionCategory::RoomMonitor) return ServerCommand::make_err(ServerCommandType::RoomResponse, "invalid session");
+        std::map<std::string, RoomData> info; std::map<int32_t, std::string> urm;
+        { std::shared_lock lk(srv->rooms_mu);
+          for (auto& [rid, room] : srv->rooms) {
+              for (auto& up : room->get_users()) urm[up->id] = rid;
+              info[rid] = room->into_data();
+          }
+        }
+        return ServerCommand::make_room_response(info, urm);
+    }
+    default: return std::nullopt;
     }
 }

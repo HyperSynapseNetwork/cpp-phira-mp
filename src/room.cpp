@@ -1,330 +1,173 @@
-#include "room.h"
-#include "session.h"
-#include "server.h"
-#include "web_server.h"
-#include <algorithm>
-#include <iostream>
+#include "room.hpp"
+#include "session.hpp"
+#include <spdlog/spdlog.h>
+#include <cmath>
 #include <random>
-#include <sstream>
+#include <algorithm>
+#include <cstring>
 
-// ── InternalRoomState ────────────────────────────────────────────────
-RoomState InternalRoomState::to_client(std::optional<int32_t> chart_id) const {
+// ── InternalRoomState ─────────────────────────────────────────────────
+RoomState InternalRoomState::to_client(std::optional<int32_t> chart) const {
+    RoomState rs;
     switch (type) {
-    case InternalRoomStateType::SelectChart:
-        return RoomState::select_chart(chart_id);
-    case InternalRoomStateType::WaitForReady:
-        return RoomState::waiting_for_ready();
-    case InternalRoomStateType::Playing:
-        return RoomState::playing();
+    case Type::SelectChart: rs.type = RoomStateType::SelectChart; rs.chart_id = chart; break;
+    case Type::WaitForReady: rs.type = RoomStateType::WaitingForReady; break;
+    case Type::Playing: rs.type = RoomStateType::Playing; break;
     }
-    return RoomState::select_chart();
+    return rs;
+}
+StrippedRoomState InternalRoomState::to_stripped() const {
+    switch (type) {
+    case Type::SelectChart: return StrippedRoomState::SelectingChart;
+    case Type::WaitForReady: return StrippedRoomState::WaitingForReady;
+    case Type::Playing: return StrippedRoomState::Playing;
+    }
+    return StrippedRoomState::SelectingChart;
 }
 
-// ── Room ─────────────────────────────────────────────────────────────
+// ── Room ──────────────────────────────────────────────────────────────
+Room::Room(const RoomId& rid, std::weak_ptr<User> h) : id(rid), host(h) { users_.push_back(h); }
 
-Room::Room(RoomId rid, std::weak_ptr<User> host_user)
-    : id(std::move(rid)), host(std::move(host_user))
-{
-    // The host is the first user
-    auto h = host.lock();
-    if (h) {
-        users_.push_back(std::weak_ptr<User>(host));
-    }
-}
-
-RoomState Room::client_room_state() const {
-    std::shared_lock sl(state_mtx);
-    std::shared_lock cl(chart_mtx);
-    std::optional<int32_t> cid;
-    if (chart) cid = chart->id;
+RoomState Room::client_room_state() {
+    std::shared_lock l1(state_mu), l2(chart_mu);
+    std::optional<int32_t> cid; if (chart) cid = chart->id;
     return state.to_client(cid);
 }
 
-ClientRoomState Room::client_state(const User& user) const {
-    ClientRoomState cs;
-    cs.id = id;
-    cs.state = client_room_state();
-    cs.live = is_live();
-    cs.locked = is_locked();
-    cs.cycle_flag = is_cycle();
-    cs.is_host = check_host(user);
-    {
-        std::shared_lock sl(state_mtx);
-        cs.is_ready = (state.type == InternalRoomStateType::WaitForReady &&
-                       state.started.count(user.id) > 0);
-    }
-    auto u = users();
-    auto m = monitors();
-    for (auto& usr : u) cs.users[usr->id] = usr->to_info();
-    for (auto& usr : m) cs.users[usr->id] = usr->to_info();
+ClientRoomState Room::client_state(const User& u) {
+    ClientRoomState cs; cs.id = id; cs.state = client_room_state();
+    cs.live = is_live(); cs.locked = is_locked(); cs.cycle = is_cycle();
+    { std::shared_lock lk(host_mu); auto h = host.lock(); cs.is_host = h && h->id == u.id; }
+    { std::shared_lock lk(state_mu); if (state.type == InternalRoomState::Type::WaitForReady) cs.is_ready = state.started.count(u.id) > 0; }
+    for (auto& p : get_users()) cs.users[p->id] = p->to_info();
+    for (auto& p : get_monitors()) cs.users[p->id] = p->to_info();
     return cs;
 }
 
-void Room::on_state_change() {
-    broadcast(ServerCommand::change_state(client_room_state()));
-    // SSE: update_room
-    if (g_web_server) {
-        std::string state_str;
-        {
-            std::shared_lock sl(state_mtx);
-            switch (state.type) {
-                case InternalRoomStateType::SelectChart: state_str = "SELECTING_CHART"; break;
-                case InternalRoomStateType::WaitForReady: state_str = "WAITING_FOR_READY"; break;
-                case InternalRoomStateType::Playing: state_str = "PLAYING"; break;
-            }
-        }
-        std::optional<int32_t> cid;
-        {
-            std::shared_lock cl(chart_mtx);
-            if (chart) cid = chart->id;
-        }
-        std::ostringstream oss;
-        oss << "{\"room\":\"" << id.to_string() << "\",\"data\":{\"state\":\"" << state_str << "\"";
-        if (cid) oss << ",\"chart\":" << *cid;
-        oss << ",\"lock\":" << (is_locked() ? "true" : "false");
-        oss << ",\"cycle\":" << (is_cycle() ? "true" : "false");
-        oss << "}}";
-        g_web_server->broadcast_sse("update_room", oss.str());
+bool Room::add_user(std::weak_ptr<User> u, bool mon) {
+    if (mon) { std::unique_lock lk(monitors_mu_);
+        monitors_.erase(std::remove_if(monitors_.begin(), monitors_.end(), [](auto& w){ return w.expired(); }), monitors_.end());
+        monitors_.push_back(u); return true;
+    } else { std::unique_lock lk(users_mu_);
+        users_.erase(std::remove_if(users_.begin(), users_.end(), [](auto& w){ return w.expired(); }), users_.end());
+        if (users_.size() >= ROOM_MAX_USERS) return false;
+        users_.push_back(u); return true;
     }
 }
 
-bool Room::add_user(std::weak_ptr<User> user, bool is_monitor) {
-    if (is_monitor) {
-        std::unique_lock lock(monitors_mtx);
-        // Clean expired
-        monitors_.erase(
-            std::remove_if(monitors_.begin(), monitors_.end(),
-                           [](auto& w) { return w.expired(); }),
-            monitors_.end());
-        monitors_.push_back(std::move(user));
-        return true;
+std::vector<std::shared_ptr<User>> Room::get_users() {
+    std::shared_lock lk(users_mu_); std::vector<std::shared_ptr<User>> r;
+    for (auto& w : users_) if (auto s = w.lock()) r.push_back(s); return r;
+}
+std::vector<std::shared_ptr<User>> Room::get_monitors() {
+    std::shared_lock lk(monitors_mu_); std::vector<std::shared_ptr<User>> r;
+    for (auto& w : monitors_) if (auto s = w.lock()) r.push_back(s); return r;
+}
+void Room::check_host_throw(const User& u) {
+    std::shared_lock lk(host_mu); auto h = host.lock();
+    if (!h || h->id != u.id) throw std::runtime_error("only host can do this");
+}
+void Room::send_msg(const Message& m) { broadcast(ServerCommand::make_message(m)); }
+void Room::broadcast(const ServerCommand& c) {
+    for (auto& u : get_users()) u->try_send(c);
+    for (auto& m : get_monitors()) m->try_send(c);
+}
+void Room::broadcast_monitors(const ServerCommand& c) { for (auto& m : get_monitors()) m->try_send(c); }
+void Room::send_as(const User& u, const std::string& content) {
+    Message m; m.type = MessageType::Chat; m.user = u.id; m.content = content; send_msg(m);
+}
+void Room::on_state_change() { broadcast(ServerCommand::make_change_state(client_room_state())); }
+
+bool Room::on_user_leave(const User& u) {
+    { Message m; m.type = MessageType::LeaveRoom; m.user = u.id; m.name = u.name; send_msg(m); }
+    { std::unique_lock lk(u.room_mu); const_cast<User&>(u).room.reset(); }
+    if (u.monitor.load(std::memory_order_seq_cst)) {
+        std::unique_lock lk(monitors_mu_);
+        monitors_.erase(std::remove_if(monitors_.begin(), monitors_.end(), [&](auto& w){ auto s = w.lock(); return !s || s->id == u.id; }), monitors_.end());
     } else {
-        std::unique_lock lock(users_mtx);
-        users_.erase(
-            std::remove_if(users_.begin(), users_.end(),
-                           [](auto& w) { return w.expired(); }),
-            users_.end());
-        if ((int)users_.size() >= ROOM_MAX_USERS) return false;
-        users_.push_back(std::move(user));
-        return true;
+        std::unique_lock lk(users_mu_);
+        users_.erase(std::remove_if(users_.begin(), users_.end(), [&](auto& w){ auto s = w.lock(); return !s || s->id == u.id; }), users_.end());
     }
-}
-
-std::vector<std::shared_ptr<User>> Room::users() const {
-    std::shared_lock lock(users_mtx);
-    std::vector<std::shared_ptr<User>> result;
-    for (auto& w : users_) {
-        if (auto s = w.lock()) result.push_back(s);
+    bool was_host = false;
+    { std::shared_lock lk(host_mu); auto h = host.lock(); was_host = h && h->id == u.id; }
+    if (was_host) {
+        spdlog::info("host disconnected!");
+        auto users = get_users();
+        if (users.empty()) { spdlog::info("all disconnected, dropping room"); return true; }
+        static thread_local std::mt19937 rng(std::random_device{}());
+        std::uniform_int_distribution<size_t> dist(0, users.size()-1);
+        auto nh = users[dist(rng)];
+        { std::unique_lock lk(host_mu); host = nh; }
+        Message m; m.type = MessageType::NewHost; m.user = nh->id; send_msg(m);
+        nh->try_send(ServerCommand::make_change_host(true));
     }
-    return result;
-}
-
-std::vector<std::shared_ptr<User>> Room::monitors() const {
-    std::shared_lock lock(monitors_mtx);
-    std::vector<std::shared_ptr<User>> result;
-    for (auto& w : monitors_) {
-        if (auto s = w.lock()) result.push_back(s);
-    }
-    return result;
-}
-
-bool Room::check_host(const User& user) const {
-    std::shared_lock lock(host_mtx);
-    auto h = host.lock();
-    return h && h->id == user.id;
-}
-
-void Room::send(Message msg) {
-    broadcast(ServerCommand::msg(std::move(msg)));
-}
-
-void Room::broadcast(ServerCommand cmd) {
-    auto u = users();
-    auto m = monitors();
-    for (auto& usr : u) usr->try_send(cmd);
-    for (auto& usr : m) usr->try_send(cmd);
-}
-
-void Room::broadcast_monitors(ServerCommand cmd) {
-    auto m = monitors();
-    for (auto& usr : m) usr->try_send(cmd);
-}
-
-void Room::send_as(const User& user, const std::string& content) {
-    send(Message::chat(user.id, content));
-}
-
-bool Room::on_user_leave(const User& user) {
-    send(Message::leave_room(user.id, user.name));
-
-    // Clear user's room reference
-    // (caller should handle this)
-
-    bool is_mon = user.monitor.load();
-    if (is_mon) {
-        std::unique_lock lock(monitors_mtx);
-        monitors_.erase(
-            std::remove_if(monitors_.begin(), monitors_.end(),
-                           [&](auto& w) {
-                               auto s = w.lock();
-                               return !s || s->id == user.id;
-                           }),
-            monitors_.end());
-    } else {
-        std::unique_lock lock(users_mtx);
-        users_.erase(
-            std::remove_if(users_.begin(), users_.end(),
-                           [&](auto& w) {
-                               auto s = w.lock();
-                               return !s || s->id == user.id;
-                           }),
-            users_.end());
-    }
-
-    if (check_host(user)) {
-        std::cerr << "[room] host disconnected!" << std::endl;
-        auto usr_list = users();
-        if (usr_list.empty()) {
-            std::cerr << "[room] room users all disconnected, dropping room" << std::endl;
-            return true;
-        } else {
-            // Pick random new host
-            static thread_local std::mt19937 rng(std::random_device{}());
-            std::uniform_int_distribution<size_t> dist(0, usr_list.size() - 1);
-            auto& new_host = usr_list[dist(rng)];
-            std::cerr << "[room] selected " << new_host->id << " as host" << std::endl;
-            {
-                std::unique_lock lock(host_mtx);
-                host = std::weak_ptr<User>(new_host);
-            }
-            send(Message::new_host(new_host->id));
-            new_host->try_send(ServerCommand::change_host(true));
-        }
-    }
-
     check_all_ready();
     return false;
 }
 
 void Room::reset_game_time() {
-    uint32_t neg_inf;
-    float val = -std::numeric_limits<float>::infinity();
-    memcpy(&neg_inf, &val, 4);
-    for (auto& u : users()) {
-        u->game_time.store(neg_inf);
-    }
+    uint32_t neg; float ni = -std::numeric_limits<float>::infinity(); std::memcpy(&neg, &ni, 4);
+    for (auto& u : get_users()) u->game_time.store(neg, std::memory_order_seq_cst);
 }
 
 void Room::check_all_ready() {
-    std::unique_lock lock(state_mtx);
-
-    if (state.type == InternalRoomStateType::WaitForReady) {
-        auto u = users();
-        auto m = monitors();
-        bool all_ready = true;
-        for (auto& usr : u) {
-            if (state.started.count(usr->id) == 0) { all_ready = false; break; }
-        }
-        if (all_ready) {
-            for (auto& usr : m) {
-                if (state.started.count(usr->id) == 0) { all_ready = false; break; }
-            }
-        }
-        if (all_ready) {
-            lock.unlock();
-            std::cerr << "[room] game start: " << id.to_string() << std::endl;
-            send(Message::start_playing());
+    std::unique_lock lk(state_mu);
+    if (state.type == InternalRoomState::Type::WaitForReady) {
+        auto us = get_users(), ms = get_monitors();
+        bool all = true;
+        for (auto& u : us) if (!state.started.count(u->id)) { all = false; break; }
+        if (all) for (auto& m : ms) if (!state.started.count(m->id)) { all = false; break; }
+        if (all) {
+            lk.unlock();
+            spdlog::info("room {}: game start", id.to_string());
+            Message m; m.type = MessageType::StartPlaying; send_msg(m);
             reset_game_time();
-            {
-                std::unique_lock lock2(state_mtx);
-                state = InternalRoomState::playing();
-            }
-            // SSE: start_round
-            if (g_web_server) {
-                g_web_server->broadcast_sse("start_round",
-                    "{\"room\":\"" + id.to_string() + "\"}");
-            }
+            { std::unique_lock l2(state_mu); state.type = InternalRoomState::Type::Playing; state.results.clear(); state.aborted.clear(); state.started.clear(); }
             on_state_change();
         }
-    } else if (state.type == InternalRoomStateType::Playing) {
-        auto u = users();
-        bool all_done = true;
-        for (auto& usr : u) {
-            if (state.results.count(usr->id) == 0 && state.aborted.count(usr->id) == 0) {
-                all_done = false;
-                break;
-            }
-        }
-        if (all_done) {
-            // Save round history before clearing state
-            RoundHistory round;
-            {
-                std::shared_lock cl(chart_mtx);
-                if (chart) round.chart_id = chart->id;
-            }
-            for (auto& [uid, rec] : state.results) {
-                round.records.push_back(rec);
-            }
-            {
-                std::unique_lock rl(rounds_mtx);
-                rounds_history.push_back(std::move(round));
-            }
-
-            // SSE: player scores + start_round
-            if (g_web_server) {
-                for (auto& [uid, rec] : state.results) {
-                    std::ostringstream oss;
-                    oss << "{\"room\":\"" << id.to_string() << "\",\"record\":"
-                        << "{\"id\":" << rec.id << ",\"player\":" << rec.player
-                        << ",\"score\":" << rec.score << ",\"perfect\":" << rec.perfect
-                        << ",\"good\":" << rec.good << ",\"bad\":" << rec.bad
-                        << ",\"miss\":" << rec.miss << ",\"max_combo\":" << rec.max_combo
-                        << ",\"accuracy\":" << rec.accuracy
-                        << ",\"full_combo\":" << (rec.full_combo ? "true" : "false")
-                        << ",\"std\":" << rec.std_dev << ",\"std_score\":" << rec.std_score
-                        << "}}";
-                    g_web_server->broadcast_sse("player_score", oss.str());
-                }
-            }
-
-            lock.unlock();
-            send(Message::game_end());
-            {
-                std::unique_lock lock2(state_mtx);
-                state = InternalRoomState::select_chart();
+    } else if (state.type == InternalRoomState::Type::Playing) {
+        auto us = get_users();
+        bool all = true;
+        for (auto& u : us) if (!state.results.count(u->id) && !state.aborted.count(u->id)) { all = false; break; }
+        if (all) {
+            lk.unlock();
+            { Message m; m.type = MessageType::GameEnd; send_msg(m); }
+            { std::unique_lock l2(state_mu);
+              if (state.type == InternalRoomState::Type::Playing) {
+                  std::unique_lock l3(rounds_mu); std::shared_lock l4(chart_mu);
+                  RoundData rd; rd.chart = chart ? chart->id : -1;
+                  for (auto& [uid, rec] : state.results) rd.records.push_back(rec);
+                  rounds.push_back(rd);
+                  state.type = InternalRoomState::Type::SelectChart; state.results.clear(); state.aborted.clear();
+              }
             }
             if (is_cycle()) {
-                std::cerr << "[room] cycling: " << id.to_string() << std::endl;
-                std::shared_ptr<User> old_host_ptr;
-                std::shared_ptr<User> new_host_ptr;
-                {
-                    std::shared_lock hl(host_mtx);
-                    old_host_ptr = host.lock();
-                }
-                auto usr_list = users();
-                if (!usr_list.empty()) {
-                    size_t index = 0;
-                    if (old_host_ptr) {
-                        for (size_t i = 0; i < usr_list.size(); i++) {
-                            if (usr_list[i]->id == old_host_ptr->id) {
-                                index = (i + 1) % usr_list.size();
-                                break;
-                            }
-                        }
-                    }
-                    new_host_ptr = usr_list[index];
-                    {
-                        std::unique_lock hl(host_mtx);
-                        host = std::weak_ptr<User>(new_host_ptr);
-                    }
-                    send(Message::new_host(new_host_ptr->id));
-                    if (old_host_ptr) {
-                        old_host_ptr->try_send(ServerCommand::change_host(false));
-                    }
-                    new_host_ptr->try_send(ServerCommand::change_host(true));
+                spdlog::debug("room {}: cycling", id.to_string());
+                std::shared_ptr<User> old_h, new_h;
+                { std::shared_lock hl(host_mu); old_h = host.lock(); }
+                auto us2 = get_users();
+                if (!us2.empty()) {
+                    size_t idx = 0;
+                    for (size_t i = 0; i < us2.size(); i++) if (old_h && us2[i]->id == old_h->id) { idx = (i+1) % us2.size(); break; }
+                    new_h = us2[idx];
+                    { std::unique_lock hl(host_mu); host = new_h; }
+                    Message m; m.type = MessageType::NewHost; m.user = new_h->id; send_msg(m);
+                    if (old_h) old_h->try_send(ServerCommand::make_change_host(false));
+                    new_h->try_send(ServerCommand::make_change_host(true));
                 }
             }
             on_state_change();
         }
     }
+}
+
+RoomData Room::into_data() {
+    RoomData rd;
+    { std::shared_lock lk(host_mu); auto h = host.lock(); rd.host = h ? h->id : -1; }
+    for (auto& u : get_users()) rd.users.push_back(u->id);
+    rd.lock = is_locked(); rd.cycle = is_cycle();
+    { std::shared_lock lk(chart_mu); if (chart) rd.chart = chart->id; }
+    { std::shared_lock lk(state_mu); rd.state = state.to_stripped(); }
+    { std::shared_lock lk(rounds_mu); rd.rounds = rounds; }
+    return rd;
 }
