@@ -1,37 +1,32 @@
-CXX = g++
-CXXFLAGS = -std=c++20 -Wall -Wextra -O2 -pthread -Iinclude -static
-LDFLAGS = -pthread -luuid -lssl -lcrypto -static
+CXX      := g++
+CXXFLAGS := -std=c++20 -Wall -Wextra -O2 -pthread
+INCLUDES := -Iinclude
+LDFLAGS  :=
 
-SRCDIR = src
-INCDIR = include
-OBJDIR = obj
-TARGET = phira-mp-server
+CXXFLAGS += $(shell pkg-config --cflags spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
 
-SOURCES = $(wildcard $(SRCDIR)/*.cpp)
-OBJECTS = $(patsubst $(SRCDIR)/%.cpp,$(OBJDIR)/%.o,$(SOURCES))
+LIBS := $(shell pkg-config --libs spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null) \
+        -luuid -lpthread
+
+SRCS := src/main.cpp src/binary.cpp src/command.cpp src/stream.cpp \
+        src/l10n.cpp src/room.cpp src/session.cpp src/server.cpp \
+        src/http_server.cpp
+
+OBJS := $(SRCS:.cpp=.o)
+TARGET := phira-mp-server
+
+LOCALES_DIR := $(CURDIR)/locales
+CXXFLAGS += -DLOCALES_DIR=\"$(LOCALES_DIR)\"
 
 .PHONY: all clean
 
 all: $(TARGET)
 
-$(TARGET): $(OBJECTS)
-	$(CXX) $(OBJECTS) -o $@ $(LDFLAGS)
+$(TARGET): $(OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LIBS)
 
-$(OBJDIR)/%.o: $(SRCDIR)/%.cpp | $(OBJDIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(OBJDIR):
-	mkdir -p $(OBJDIR)
+src/%.o: src/%.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<
 
 clean:
-	rm -rf $(OBJDIR) $(TARGET)
-
-# Dependencies
-$(OBJDIR)/main.o: $(INCDIR)/server.h $(INCDIR)/l10n.h $(INCDIR)/ban_manager.h $(INCDIR)/web_server.h $(INCDIR)/ws_server.h
-$(OBJDIR)/server.o: $(INCDIR)/server.h $(INCDIR)/session.h $(INCDIR)/commands.h
-$(OBJDIR)/session.o: $(INCDIR)/session.h $(INCDIR)/room.h $(INCDIR)/server.h $(INCDIR)/ban_manager.h $(INCDIR)/web_server.h $(INCDIR)/ws_server.h
-$(OBJDIR)/room.o: $(INCDIR)/room.h $(INCDIR)/session.h $(INCDIR)/commands.h $(INCDIR)/web_server.h
-$(OBJDIR)/l10n.o: $(INCDIR)/l10n.h
-$(OBJDIR)/http_client.o: $(INCDIR)/http_client.h
-$(OBJDIR)/web_server.o: $(INCDIR)/web_server.h $(INCDIR)/server.h $(INCDIR)/ban_manager.h
-$(OBJDIR)/ws_server.o: $(INCDIR)/ws_server.h $(INCDIR)/server.h
+	rm -f $(OBJS) $(TARGET)
