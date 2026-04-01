@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════
-  # Linux builds (native amd64 + cross arm64/armhf)
+  # Linux builds — fully static (native amd64 + cross arm64/armhf)
   # ═══════════════════════════════════════════════════════════════════
   build-linux:
     runs-on: ubuntu-24.04
@@ -45,7 +45,7 @@ jobs:
         run: |
           sudo dpkg --add-architecture ${{ matrix.pkg_arch }}
 
-          # ── Fix: pin default sources to amd64 only ──
+          # Pin default sources to amd64 only
           if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
             sudo sed -i 's/^Types: deb$/Types: deb\nArchitectures: amd64/' /etc/apt/sources.list.d/ubuntu.sources
           fi
@@ -53,7 +53,7 @@ jobs:
             sudo sed -i 's|^deb http|deb [arch=amd64] http|g' /etc/apt/sources.list
           fi
 
-          # ── Add ports.ubuntu.com for the foreign architecture ──
+          # Add ports.ubuntu.com for the foreign architecture
           cat <<EOF | sudo tee /etc/apt/sources.list.d/multiarch.list > /dev/null
           deb [arch=${{ matrix.pkg_arch }}] http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
           deb [arch=${{ matrix.pkg_arch }}] http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse
@@ -69,7 +69,11 @@ jobs:
             sudo apt-get install -y -qq \
               g++ pkg-config \
               libboost-dev libcurl4-openssl-dev libssl-dev \
-              libspdlog-dev libargon2-dev nlohmann-json3-dev uuid-dev
+              libspdlog-dev libargon2-dev nlohmann-json3-dev uuid-dev \
+              zlib1g-dev libnghttp2-dev libbrotli-dev libzstd-dev \
+              libpsl-dev libidn2-dev libunistring-dev \
+              libkrb5-dev libldap-dev libsasl2-dev \
+              libssh-dev librtmp-dev
           else
             sudo apt-get install -y -qq \
               g++-${{ matrix.triplet }} pkg-config \
@@ -79,7 +83,19 @@ jobs:
               libspdlog-dev:${{ matrix.pkg_arch }} \
               libargon2-dev:${{ matrix.pkg_arch }} \
               nlohmann-json3-dev:${{ matrix.pkg_arch }} \
-              uuid-dev:${{ matrix.pkg_arch }}
+              uuid-dev:${{ matrix.pkg_arch }} \
+              zlib1g-dev:${{ matrix.pkg_arch }} \
+              libnghttp2-dev:${{ matrix.pkg_arch }} \
+              libbrotli-dev:${{ matrix.pkg_arch }} \
+              libzstd-dev:${{ matrix.pkg_arch }} \
+              libpsl-dev:${{ matrix.pkg_arch }} \
+              libidn2-dev:${{ matrix.pkg_arch }} \
+              libunistring-dev:${{ matrix.pkg_arch }} \
+              libkrb5-dev:${{ matrix.pkg_arch }} \
+              libldap-dev:${{ matrix.pkg_arch }} \
+              libsasl2-dev:${{ matrix.pkg_arch }} \
+              libssh-dev:${{ matrix.pkg_arch }} \
+              librtmp-dev:${{ matrix.pkg_arch }}
           fi
 
       - name: Build
@@ -88,18 +104,18 @@ jobs:
           CXX: ${{ matrix.cxx }}
         run: |
           if [ "${{ matrix.arch }}" = "amd64" ]; then
-            make -j$(nproc)
+            make -j$(nproc) STATIC=1
           else
-            # Cross-compile: set PKG_CONFIG_LIBDIR so $(shell pkg-config ...)
-            # inside the Makefile resolves the correct .pc files for the target
-            # architecture. PKG_CONFIG_LIBDIR *replaces* the built-in search path,
-            # so we must include /usr/share/pkgconfig for arch-independent packages
-            # (e.g. nlohmann_json).
             export PKG_CONFIG_LIBDIR=/usr/lib/${{ matrix.triplet }}/pkgconfig:/usr/share/pkgconfig
             export PKG_CONFIG_SYSROOT_DIR=/
-            make -j$(nproc) CXX=${{ matrix.cxx }}
+            make -j$(nproc) CXX=${{ matrix.cxx }} STATIC=1
           fi
           strip phira-mp-server || ${{ matrix.triplet }}-strip phira-mp-server || true
+
+      - name: Verify static
+        run: |
+          file phira-mp-server
+          ldd phira-mp-server 2>&1 || echo "(expected: not a dynamic executable)"
 
       - name: Package
         run: |
@@ -114,7 +130,7 @@ jobs:
           path: phira-mp-server-linux-${{ matrix.arch }}.tar.gz
 
   # ═══════════════════════════════════════════════════════════════════
-  # Windows amd64 build (MSYS2 UCRT64)
+  # Windows amd64 build (MSYS2 UCRT64) — dynamic
   # ═══════════════════════════════════════════════════════════════════
   build-windows:
     runs-on: windows-latest
@@ -147,6 +163,7 @@ jobs:
           cat > Makefile.win << 'MF'
           CXX      := g++
           CXXFLAGS := -std=c++20 -Wall -Wextra -O2 -pthread -DWIN32_LEAN_AND_MEAN
+          CXXFLAGS += -Wno-array-bounds
           INCLUDES := -Iinclude
           CXXFLAGS += $(shell pkg-config --cflags spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
           LIBS := $(shell pkg-config --libs spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null) \
