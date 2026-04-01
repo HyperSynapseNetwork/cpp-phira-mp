@@ -14,6 +14,11 @@ permissions:
 jobs:
   # ═══════════════════════════════════════════════════════════════════
   # Linux builds — fully static (native amd64 + cross arm64/armhf)
+  #
+  # Ubuntu 24.04's system libcurl.a is compiled with SSH, Kerberos,
+  # LDAP and RTMP — none of which ship static .a archives.  We therefore
+  # build libcurl (plus fmt and spdlog) from source with only the
+  # features we need, so `-static` linking works cleanly.
   # ═══════════════════════════════════════════════════════════════════
   build-linux:
     runs-on: ubuntu-24.04
@@ -37,6 +42,10 @@ jobs:
             cc: arm-linux-gnueabihf-gcc
             cxx: arm-linux-gnueabihf-g++
 
+    env:
+      # Where from-source static libs are installed
+      STATIC_PREFIX: /opt/static-${{ matrix.arch }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -44,31 +53,27 @@ jobs:
         if: matrix.arch != 'amd64'
         run: |
           sudo dpkg --add-architecture ${{ matrix.pkg_arch }}
-
           if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
             sudo sed -i 's/^Types: deb$/Types: deb\nArchitectures: amd64/' /etc/apt/sources.list.d/ubuntu.sources
           fi
           if [ -f /etc/apt/sources.list ]; then
             sudo sed -i 's|^deb http|deb [arch=amd64] http|g' /etc/apt/sources.list
           fi
-
           cat <<EOF | sudo tee /etc/apt/sources.list.d/multiarch.list > /dev/null
           deb [arch=${{ matrix.pkg_arch }}] http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
           deb [arch=${{ matrix.pkg_arch }}] http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse
           deb [arch=${{ matrix.pkg_arch }}] http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse
           EOF
-
           sudo apt-get update -qq
 
-      - name: Install toolchain
+      - name: Install toolchain & system static libs
         run: |
           sudo apt-get update -qq
-          # Note: we do NOT install libspdlog-dev or libfmt-dev — we build
-          # them from source below so that static .a archives exist.
+          # Libs that DO ship .a on Ubuntu (no curl, spdlog, fmt here)
           if [ "${{ matrix.arch }}" = "amd64" ]; then
             sudo apt-get install -y -qq \
               g++ cmake pkg-config \
-              libboost-dev libcurl4-openssl-dev libssl-dev \
+              libboost-dev libssl-dev \
               libargon2-dev nlohmann-json3-dev uuid-dev \
               zlib1g-dev libnghttp2-dev libbrotli-dev libzstd-dev \
               libpsl-dev libidn2-dev libunistring-dev
@@ -76,7 +81,6 @@ jobs:
             sudo apt-get install -y -qq \
               g++-${{ matrix.triplet }} cmake pkg-config \
               libboost-dev:${{ matrix.pkg_arch }} \
-              libcurl4-openssl-dev:${{ matrix.pkg_arch }} \
               libssl-dev:${{ matrix.pkg_arch }} \
               libargon2-dev:${{ matrix.pkg_arch }} \
               nlohmann-json3-dev:${{ matrix.pkg_arch }} \
@@ -90,45 +94,81 @@ jobs:
               libunistring-dev:${{ matrix.pkg_arch }}
           fi
 
-      - name: Build fmt & spdlog from source (static)
-        env:
-          CC: ${{ matrix.cc }}
-          CXX: ${{ matrix.cxx }}
+      - name: Build static deps from source (fmt, spdlog, curl)
         run: |
-          # ── Determine install prefix ──
+          set -e
+          sudo mkdir -p $STATIC_PREFIX
+
+          # ── Cross-compile helpers ──
           if [ "${{ matrix.arch }}" = "amd64" ]; then
-            PREFIX=/usr/local
-            CMAKE_EXTRA=""
+            CM_CROSS=""
+            CURL_HOST=""
+            SYSLIB=/usr/lib/x86_64-linux-gnu
           else
-            PREFIX=/usr/${{ matrix.triplet }}
-            CMAKE_EXTRA="-DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DCMAKE_SYSTEM_NAME=Linux"
+            CM_CROSS="-DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DCMAKE_SYSTEM_NAME=Linux"
+            case "${{ matrix.arch }}" in
+              arm64) CURL_HOST="--host=aarch64-linux-gnu" ;;
+              armhf) CURL_HOST="--host=arm-linux-gnueabihf" ;;
+            esac
+            SYSLIB=/usr/lib/${{ matrix.triplet }}
           fi
 
-          # ── fmt 9.1.0 (matches Ubuntu 24.04 header version) ──
+          # ── fmt 9.1.0 ──
           git clone --depth 1 --branch 9.1.0 https://github.com/fmtlib/fmt.git /tmp/fmt
           cmake -S /tmp/fmt -B /tmp/fmt/build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=$PREFIX \
+            -DCMAKE_INSTALL_PREFIX=$STATIC_PREFIX \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DFMT_DOC=OFF -DFMT_TEST=OFF \
             -DBUILD_SHARED_LIBS=OFF \
-            $CMAKE_EXTRA
+            $CM_CROSS
           cmake --build /tmp/fmt/build -j$(nproc)
           sudo cmake --install /tmp/fmt/build
 
-          # ── spdlog 1.12.0 (matches Ubuntu 24.04 header version) ──
+          # ── spdlog 1.12.0 ──
           git clone --depth 1 --branch v1.12.0 https://github.com/gabime/spdlog.git /tmp/spdlog
           cmake -S /tmp/spdlog -B /tmp/spdlog/build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=$PREFIX \
+            -DCMAKE_INSTALL_PREFIX=$STATIC_PREFIX \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DSPDLOG_BUILD_SHARED=OFF \
             -DSPDLOG_FMT_EXTERNAL=ON \
             -DSPDLOG_BUILD_EXAMPLE=OFF -DSPDLOG_BUILD_TESTS=OFF \
-            -DCMAKE_PREFIX_PATH=$PREFIX \
-            $CMAKE_EXTRA
+            -DCMAKE_PREFIX_PATH=$STATIC_PREFIX \
+            $CM_CROSS
           cmake --build /tmp/spdlog/build -j$(nproc)
           sudo cmake --install /tmp/spdlog/build
+
+          # ── curl 8.5.0 (minimal: only HTTP/HTTPS, no SSH/GSSAPI/LDAP/RTMP) ──
+          git clone --depth 1 --branch curl-8_5_0 https://github.com/curl/curl.git /tmp/curl
+          cd /tmp/curl
+          autoreconf -fi
+          # Tell configure where to find cross-arch OpenSSL, nghttp2 etc.
+          PKG_CONFIG_LIBDIR="${SYSLIB}/pkgconfig:/usr/share/pkgconfig" \
+          CC="${{ matrix.cc }}" \
+          ./configure \
+            $CURL_HOST \
+            --prefix=$STATIC_PREFIX \
+            --disable-shared --enable-static \
+            --with-openssl \
+            --with-nghttp2 \
+            --with-zstd \
+            --with-brotli \
+            --without-libssh --without-libssh2 \
+            --without-gssapi \
+            --without-libidn2 \
+            --without-librtmp \
+            --disable-ldap --disable-ldaps \
+            --disable-rtsp \
+            --disable-dict --disable-telnet --disable-tftp \
+            --disable-pop3 --disable-imap --disable-smb --disable-smtp \
+            --disable-gopher --disable-mqtt \
+            --disable-manual --disable-docs \
+            --disable-ntlm \
+            --silent
+          make -j$(nproc) V=0
+          sudo make install
+          cd -
 
       - name: Build
         env:
@@ -136,11 +176,11 @@ jobs:
           CXX: ${{ matrix.cxx }}
         run: |
           if [ "${{ matrix.arch }}" = "amd64" ]; then
-            make -j$(nproc) STATIC=1
+            make -j$(nproc) STATIC=1 STATIC_PREFIX=$STATIC_PREFIX
           else
-            export PKG_CONFIG_LIBDIR=/usr/lib/${{ matrix.triplet }}/pkgconfig:/usr/share/pkgconfig
+            export PKG_CONFIG_LIBDIR=/usr/lib/${{ matrix.triplet }}/pkgconfig:/usr/share/pkgconfig:$STATIC_PREFIX/lib/pkgconfig
             export PKG_CONFIG_SYSROOT_DIR=/
-            make -j$(nproc) CXX=${{ matrix.cxx }} STATIC=1
+            make -j$(nproc) CXX=${{ matrix.cxx }} STATIC=1 STATIC_PREFIX=$STATIC_PREFIX
           fi
           strip phira-mp-server || ${{ matrix.triplet }}-strip phira-mp-server || true
 
@@ -162,17 +202,15 @@ jobs:
           path: phira-mp-server-linux-${{ matrix.arch }}.tar.gz
 
   # ═══════════════════════════════════════════════════════════════════
-  # Windows amd64 build (MSYS2 UCRT64) — dynamic
+  # Windows amd64 (MSYS2 UCRT64) — dynamic
   # ═══════════════════════════════════════════════════════════════════
   build-windows:
     runs-on: windows-latest
     defaults:
       run:
         shell: msys2 {0}
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -188,7 +226,6 @@ jobs:
             mingw-w64-ucrt-x86_64-argon2
             mingw-w64-ucrt-x86_64-nlohmann-json
             mingw-w64-ucrt-x86_64-fmt
-
       - name: Build
         run: |
           cat > Makefile.win << 'MF'
@@ -217,7 +254,6 @@ jobs:
           MF
           mingw32-make -f Makefile.win -j$(nproc)
           strip phira-mp-server.exe || true
-
       - name: Package
         run: |
           mkdir -p dist
@@ -226,18 +262,16 @@ jobs:
           for dll in $(ldd phira-mp-server.exe 2>/dev/null | grep ucrt64 | awk '{print $3}'); do
             cp "$dll" dist/ 2>/dev/null || true
           done
-
       - name: Create zip
         shell: pwsh
         run: Compress-Archive -Path dist\* -DestinationPath phira-mp-server-windows-amd64.zip
-
       - uses: actions/upload-artifact@v4
         with:
           name: phira-mp-server-windows-amd64
           path: phira-mp-server-windows-amd64.zip
 
   # ═══════════════════════════════════════════════════════════════════
-  # Upload release artifacts
+  # Release
   # ═══════════════════════════════════════════════════════════════════
   release:
     needs: [build-linux, build-windows]
@@ -247,7 +281,6 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:

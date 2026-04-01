@@ -6,26 +6,35 @@ INCLUDES := -Iinclude
 LDFLAGS  :=
 
 # ── Static vs shared linking ─────────────────────────────────────────
-# Usage: make STATIC=1
-#   Requires .a static archives for ALL libs. The CI builds fmt & spdlog
-#   from source and installs them to /usr/local. For other libs we use
-#   the distro -dev packages which provide .a files on Ubuntu 24.04.
+# Usage: make STATIC=1 STATIC_PREFIX=/opt/static-amd64
 #
-# The static link line is explicit (not from pkg-config --static) to
-# avoid pulling in Kerberos/LDAP/SSH/RTMP which have no .a on Ubuntu.
+# The CI builds fmt, spdlog and curl from source into STATIC_PREFIX.
+# Curl is built *without* SSH/GSSAPI/LDAP/RTMP so its .a has no
+# unresolvable transitive deps.  We use pkg-config --static from
+# that prefix to get the right flags automatically.
 # ─────────────────────────────────────────────────────────────────────
+STATIC_PREFIX ?= /usr/local
+
 ifdef STATIC
   LDFLAGS  += -static
-  # spdlog/fmt from /usr/local (built from source in CI)
+  # Add our prefix to include and library search paths
+  CXXFLAGS += -I$(STATIC_PREFIX)/include
+  LDFLAGS  += -L$(STATIC_PREFIX)/lib
+
+  # spdlog/fmt definitions (static, not shared)
   CXXFLAGS += -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL
-  CXXFLAGS += $(shell pkg-config --cflags libargon2 nlohmann_json openssl libcurl 2>/dev/null)
-  # Explicit static link order — all deps that have .a on Ubuntu 24.04
+
+  # pkg-config flags from system packages (argon2, openssl, etc.)
+  CXXFLAGS += $(shell pkg-config --cflags libargon2 nlohmann_json openssl 2>/dev/null)
+
+  # Use our from-source curl's pkg-config for --static resolution
+  CURL_STATIC_LIBS := $(shell PKG_CONFIG_PATH=$(STATIC_PREFIX)/lib/pkgconfig pkg-config --static --libs libcurl 2>/dev/null)
+
   LIBS := -lspdlog -lfmt \
           -largon2 \
-          -lcurl -lnghttp2 -lpsl -lidn2 -lunistring \
+          $(CURL_STATIC_LIBS) \
           -lssl -lcrypto \
-          -lzstd -lbrotlidec -lbrotlicommon \
-          -lz -luuid -lpthread -lrt -ldl
+          -luuid -lpthread -lrt -ldl
 else
   CXXFLAGS += $(shell pkg-config --cflags spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
   PKG_LIBS := $(shell pkg-config --libs spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
