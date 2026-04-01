@@ -2,6 +2,8 @@ name: Makefile CI
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -10,9 +12,11 @@ permissions:
   contents: write
 
 jobs:
-
+  # ═══════════════════════════════════════════════════════════════════
+  # Linux builds (native amd64 + cross arm64/armhf)
+  # ═══════════════════════════════════════════════════════════════════
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -39,11 +43,22 @@ jobs:
       - name: Enable multiarch
         if: matrix.arch != 'amd64'
         run: |
-          sudo apt-get update
           sudo dpkg --add-architecture ${{ matrix.pkg_arch }}
 
-          # Replace sources to add arch-specific URIs
-          sudo tee /etc/apt/sources.list.d/multiarch.list > /dev/null << 'SOURCES'
+          # ── Fix: pin default sources to amd64 only ──
+          # Ubuntu 24.04 uses DEB822 format in /etc/apt/sources.list.d/ubuntu.sources
+          # We need to restrict it to [arch=amd64] so apt doesn't try to fetch
+          # arm64/armhf from archive.ubuntu.com / security.ubuntu.com (which 404).
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i 's/^Types: deb$/Types: deb\nArchitectures: amd64/' /etc/apt/sources.list.d/ubuntu.sources
+          fi
+          # Also handle the classic sources.list if present
+          if [ -f /etc/apt/sources.list ]; then
+            sudo sed -i 's|^deb http|deb [arch=amd64] http|g' /etc/apt/sources.list
+          fi
+
+          # ── Add ports.ubuntu.com for the foreign architecture ──
+          sudo tee /etc/apt/sources.list.d/multiarch.list > /dev/null << SOURCES
           deb [arch=${{ matrix.pkg_arch }}] http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
           deb [arch=${{ matrix.pkg_arch }}] http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse
           deb [arch=${{ matrix.pkg_arch }}] http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse
@@ -98,7 +113,9 @@ jobs:
           name: phira-mp-server-linux-${{ matrix.arch }}
           path: phira-mp-server-linux-${{ matrix.arch }}.tar.gz
 
-
+  # ═══════════════════════════════════════════════════════════════════
+  # Windows amd64 build (MSYS2 UCRT64)
+  # ═══════════════════════════════════════════════════════════════════
   build-windows:
     runs-on: windows-latest
     defaults:
@@ -122,6 +139,7 @@ jobs:
             mingw-w64-ucrt-x86_64-spdlog
             mingw-w64-ucrt-x86_64-argon2
             mingw-w64-ucrt-x86_64-nlohmann-json
+            mingw-w64-ucrt-x86_64-fmt
 
       - name: Build
         run: |
@@ -132,7 +150,7 @@ jobs:
           INCLUDES := -Iinclude
           CXXFLAGS += $(shell pkg-config --cflags spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
           LIBS := $(shell pkg-config --libs spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null) \
-                  -lrpcrt4 -lws2_32 -lwsock32 -lpthread
+                  -lfmt -lrpcrt4 -lws2_32 -lwsock32 -lpthread
           SRCS := src/main.cpp src/binary.cpp src/command.cpp src/stream.cpp \
                   src/l10n.cpp src/room.cpp src/session.cpp src/server.cpp \
                   src/http_server.cpp
@@ -143,7 +161,7 @@ jobs:
           .PHONY: all clean
           all: $(TARGET)
           $(TARGET): $(OBJS)
-          	$(CXX) $(CXXFLAGS) -o $@ $^ $(LIBS) -static
+          	$(CXX) $(CXXFLAGS) -o $@ $^ $(LIBS)
           src/%.o: src/%.cpp
           	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<
           clean:
@@ -171,7 +189,9 @@ jobs:
           name: phira-mp-server-windows-amd64
           path: phira-mp-server-windows-amd64.zip
 
-
+  # ═══════════════════════════════════════════════════════════════════
+  # Upload release artifacts
+  # ═══════════════════════════════════════════════════════════════════
   release:
     needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
