@@ -1,23 +1,36 @@
 CXX      := g++
 CXXFLAGS := -std=c++20 -Wall -Wextra -O2 -pthread
-# Suppress GCC 13 false-positive in fmt/spdlog headers (stl_algobase.h)
-CXXFLAGS += -Wno-array-bounds
+# Suppress GCC 13 false-positives in fmt/spdlog headers (stl_algobase.h)
+CXXFLAGS += -Wno-array-bounds -Wno-stringop-overflow
 INCLUDES := -Iinclude
 LDFLAGS  :=
 
 # ── Static vs shared linking ─────────────────────────────────────────
+# Usage: make STATIC=1
+#   Requires .a static archives for ALL libs. The CI builds fmt & spdlog
+#   from source and installs them to /usr/local. For other libs we use
+#   the distro -dev packages which provide .a files on Ubuntu 24.04.
+#
+# The static link line is explicit (not from pkg-config --static) to
+# avoid pulling in Kerberos/LDAP/SSH/RTMP which have no .a on Ubuntu.
+# ─────────────────────────────────────────────────────────────────────
 ifdef STATIC
   LDFLAGS  += -static
-  PKG_STATIC := --static
-  # For static spdlog we must NOT define SPDLOG_SHARED_LIB
-  CXXFLAGS += $(shell pkg-config --cflags spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null | sed 's/-DSPDLOG_SHARED_LIB//g')
+  # spdlog/fmt from /usr/local (built from source in CI)
+  CXXFLAGS += -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL
+  CXXFLAGS += $(shell pkg-config --cflags libargon2 nlohmann_json openssl libcurl 2>/dev/null)
+  # Explicit static link order — all deps that have .a on Ubuntu 24.04
+  LIBS := -lspdlog -lfmt \
+          -largon2 \
+          -lcurl -lnghttp2 -lpsl -lidn2 -lunistring \
+          -lssl -lcrypto \
+          -lzstd -lbrotlidec -lbrotlicommon \
+          -lz -luuid -lpthread -lrt -ldl
 else
   CXXFLAGS += $(shell pkg-config --cflags spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
+  PKG_LIBS := $(shell pkg-config --libs spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
+  LIBS := $(PKG_LIBS) -luuid -lpthread
 endif
-
-# pkg-config resolves all transitive deps when --static is given
-PKG_LIBS := $(shell pkg-config $(PKG_STATIC) --libs spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
-LIBS := $(PKG_LIBS) -luuid -lpthread
 
 SRCS := src/main.cpp src/binary.cpp src/command.cpp src/stream.cpp \
         src/l10n.cpp src/room.cpp src/session.cpp src/server.cpp \
