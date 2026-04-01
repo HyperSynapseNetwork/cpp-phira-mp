@@ -6,7 +6,7 @@ LDFLAGS  :=
 CXXFLAGS += $(shell pkg-config --cflags spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
 
 LIBS := $(shell pkg-config --libs spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null) \
-        -lfmt -luuid -lpthread
+        -lfmt -luuid -lpthread -lcurl
 
 SRCS := src/main.cpp src/binary.cpp src/command.cpp src/stream.cpp \
         src/l10n.cpp src/room.cpp src/session.cpp src/server.cpp \
