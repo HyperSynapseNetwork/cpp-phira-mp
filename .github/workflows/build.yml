@@ -139,7 +139,7 @@ jobs:
           cmake --build /tmp/spdlog/build -j$(nproc)
           sudo cmake --install /tmp/spdlog/build
 
-          # ── curl 8.5.0 (minimal: only HTTP/HTTPS, no SSH/GSSAPI/LDAP/RTMP) ──
+          # ── curl 8.5.0 (minimal: only HTTP/HTTPS, no SSH/GSSAPI/LDAP/RTMP/PSL) ──
           git clone --depth 1 --branch curl-8_5_0 https://github.com/curl/curl.git /tmp/curl
           cd /tmp/curl
           autoreconf -fi
@@ -154,6 +154,7 @@ jobs:
             --with-nghttp2 \
             --with-zstd \
             --with-brotli \
+            --without-libpsl \
             --without-libssh --without-libssh2 \
             --without-gssapi \
             --without-libidn2 \

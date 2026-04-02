@@ -9,9 +9,10 @@ LDFLAGS  :=
 # Usage: make STATIC=1 STATIC_PREFIX=/opt/static-amd64
 #
 # The CI builds fmt, spdlog and curl from source into STATIC_PREFIX.
-# Curl is built *without* SSH/GSSAPI/LDAP/RTMP so its .a has no
+# Curl is built *without* SSH/GSSAPI/LDAP/RTMP/PSL so its .a has no
 # unresolvable transitive deps.  We use pkg-config --static from
-# that prefix to get the right flags automatically.
+# that prefix to get the right flags automatically, then append any
+# remaining transitive static deps that pkg-config may miss.
 # ─────────────────────────────────────────────────────────────────────
 STATIC_PREFIX ?= /usr/local
 
@@ -33,6 +34,8 @@ ifdef STATIC
   LIBS := -lspdlog -lfmt \
           -largon2 \
           $(CURL_STATIC_LIBS) \
+          -lbrotlicommon \
+          -lidn2 -lunistring \
           -lssl -lcrypto \
           -luuid -lpthread -lrt -ldl
 else
