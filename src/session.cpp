@@ -17,6 +17,17 @@ static std::string http_get(const std::string& url, const std::string& auth = ""
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
+#ifdef _WIN32
+    // On Windows the deployed binary is outside the MSYS2 tree, so
+    // OpenSSL cannot find a CA bundle.  CURLSSLOPT_NATIVE_CA (curl
+    // 8.2.0+) tells curl to fall back to the Windows certificate store.
+#ifdef CURLSSLOPT_NATIVE_CA
+    curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
+#else
+    // Older curl: try a bundled cacert.pem next to the executable
+    curl_easy_setopt(c, CURLOPT_CAINFO, "cacert.pem");
+#endif
+#endif
     struct curl_slist* hdrs = nullptr;
     if (!auth.empty()) { hdrs = curl_slist_append(hdrs, ("Authorization: " + auth).c_str()); curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs); }
     CURLcode rc = curl_easy_perform(c); long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
