@@ -1,5 +1,4 @@
 name: Makefile CI
-
 on:
   push:
     branches: [ main, master ]
@@ -13,9 +12,10 @@ permissions:
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════
-  # Linux builds — use Alpine Docker for reliable static linking
-  # Alpine uses musl libc and provides *-static packages, making
-  # fully static binaries straightforward.
+  # Linux builds — Alpine Docker for fully-static musl binaries
+  #
+  # Alpine splits static libs into separate *-static packages.
+  # Every -l<foo> used at link time needs the corresponding .a file.
   # ═══════════════════════════════════════════════════════════════════
   build-linux:
     runs-on: ubuntu-latest
@@ -50,38 +50,89 @@ jobs:
             sh -c '
               set -ex
 
-              # ── Install build dependencies ──
+              # ── Core build tools ──
               apk add --no-cache \
-                build-base make pkgconf \
+                build-base make pkgconf linux-headers
+
+              # ── Dev packages (headers + .so symlinks) ──
+              apk add --no-cache \
                 boost-dev \
-                spdlog-dev fmt-dev \
+                spdlog-dev \
+                fmt-dev \
                 nlohmann-json \
-                openssl-dev openssl-libs-static \
-                curl-dev curl-static \
+                openssl-dev \
+                curl-dev \
                 argon2-dev \
                 util-linux-dev \
+                zlib-dev \
+                brotli-dev \
+                nghttp2-dev \
+                zstd-dev
+
+              # ── Matching -static packages (provides .a files) ──
+              # These are REQUIRED for -static linking on Alpine.
+              apk add --no-cache \
+                openssl-libs-static \
+                curl-static \
                 zlib-static \
                 brotli-static \
                 nghttp2-static \
-                linux-headers
+                zstd-static \
+                spdlog-static \
+                fmt-static
 
-              # Install optional static libs (some may not exist in all Alpine versions)
-              for pkg in c-ares-dev c-ares-static libidn2-dev libidn2-static libunistring-dev libunistring-static; do
-                apk add --no-cache "$pkg" 2>/dev/null || true
+              # ── Optional -static packages (may not exist on all Alpine versions) ──
+              # Each installed individually so a missing one does not block the rest.
+              for pkg in \
+                argon2-static \
+                util-linux-static \
+                libpsl-dev libpsl-static \
+                libidn2-dev libidn2-static \
+                libunistring-dev libunistring-static \
+                c-ares-dev c-ares-static
+              do
+                apk add --no-cache "$pkg" 2>/dev/null || echo "SKIP (not found): $pkg"
               done
 
-              # ── Check what static libcurl needs ──
-              echo "=== pkg-config --static --libs libcurl ==="
+              # ── Diagnostics ──
+              echo "===== pkg-config --static --libs libcurl ====="
               pkg-config --static --libs libcurl || true
+              echo "===== pkg-config --static --libs spdlog ====="
+              pkg-config --static --libs spdlog || true
+              echo "===== Checking .a files ====="
+              ls /usr/lib/libspdlog.a /usr/lib/libfmt.a /usr/lib/libargon2.a /usr/lib/libuuid.a 2>&1 || true
+              ls /usr/lib/libcurl.a /usr/lib/libssl.a /usr/lib/libcrypto.a /usr/lib/libz.a 2>&1 || true
 
-              # ── Build with LOCALES_DIR set to relative path ──
+              # ── If argon2 static lib is still missing, build from source ──
+              if [ ! -f /usr/lib/libargon2.a ]; then
+                echo ">> Building libargon2.a from source"
+                cd /tmp
+                wget -q https://github.com/P-H-C/phc-winner-argon2/archive/refs/tags/20190702.tar.gz
+                tar xf 20190702.tar.gz && cd phc-winner-argon2-20190702
+                make -j$(nproc) LIBRARY_REL=lib ARGON2_BUILD_DIR=/usr install
+                cd /workspace
+              fi
+
+              # ── If libuuid static lib is still missing, build from source ──
+              if [ ! -f /usr/lib/libuuid.a ]; then
+                echo ">> Building libuuid.a from source"
+                cd /tmp
+                apk add --no-cache autoconf automake libtool gettext-dev
+                wget -q https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.40/util-linux-2.40.tar.xz
+                tar xf util-linux-2.40.tar.xz && cd util-linux-2.40
+                ./configure --disable-all-programs --enable-libuuid --enable-static --disable-shared --prefix=/usr
+                make -j$(nproc) && make install
+                cd /workspace
+              fi
+
+              # ── Build the project ──
               make clean
               make -j$(nproc) \
                 STATIC=1 \
                 LOCALES_DIR=\"./locales\" \
                 TARGET=phira-mp-server
 
-              # ── Verify the binary ──
+              # ── Verify ──
               file phira-mp-server
               ls -lh phira-mp-server
             '
@@ -101,196 +152,108 @@ jobs:
           path: release/${{ matrix.artifact }}.tar.gz
 
   # ═══════════════════════════════════════════════════════════════════
-  # Windows amd64 — cross-compile with MinGW-w64 on Ubuntu
+  # Windows amd64 — MSYS2 UCRT64, dynamic linking, bundle DLLs
   # ═══════════════════════════════════════════════════════════════════
   build-windows:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install MinGW-w64 and base tools
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            pkgconf
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-spdlog
+            mingw-w64-ucrt-x86_64-fmt
+            mingw-w64-ucrt-x86_64-nlohmann-json
+            mingw-w64-ucrt-x86_64-curl
+            mingw-w64-ucrt-x86_64-openssl
+
+      - name: Install or build argon2
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            g++-mingw-w64-x86-64 \
-            mingw-w64-x86-64-dev \
-            mingw-w64-tools \
-            make pkg-config \
-            cmake ninja-build \
-            git ca-certificates \
-            python3 perl
+          # Try installing from MSYS2 repo first
+          pacman -S --noconfirm mingw-w64-ucrt-x86_64-argon2 2>/dev/null && exit 0
 
-      - name: Set MinGW environment
+          echo ">> argon2 not in repo, building from source"
+          cd /tmp
+          curl -sL https://github.com/P-H-C/phc-winner-argon2/archive/refs/tags/20190702.tar.gz | tar xz
+          cd phc-winner-argon2-20190702
+          gcc -std=c89 -O2 -c src/argon2.c -Iinclude -o src/argon2.o
+          gcc -std=c89 -O2 -c src/core.c -Iinclude -o src/core.o
+          gcc -std=c89 -O2 -c src/blake2/blake2b.c -Iinclude -o src/blake2/blake2b.o
+          gcc -std=c89 -O2 -c src/thread.c -Iinclude -o src/thread.o
+          gcc -std=c89 -O2 -c src/encoding.c -Iinclude -o src/encoding.o
+          gcc -std=c89 -O2 -c src/ref.c -Iinclude -o src/ref.o
+          ar rcs libargon2.a src/argon2.o src/core.o src/blake2/blake2b.o src/thread.o src/encoding.o src/ref.o
+          cp libargon2.a /ucrt64/lib/
+          cp include/argon2.h /ucrt64/include/
+          # Create a pkg-config file
+          cat > /ucrt64/lib/pkgconfig/libargon2.pc << 'PC'
+          prefix=/ucrt64
+          libdir=${prefix}/lib
+          includedir=${prefix}/include
+
+          Name: libargon2
+          Description: Argon2 password hashing library
+          Version: 20190702
+          Libs: -L${libdir} -largon2
+          Cflags: -I${includedir}
+          PC
+
+      - name: Build
         run: |
-          echo "Setting up cross-compilation environment..."
-          # Use POSIX threading model
-          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix 2>/dev/null || true
-          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix 2>/dev/null || true
+          echo "===== pkg-config diagnostics ====="
+          pkg-config --list-all | grep -iE "argon|spdlog|curl|openssl|nlohmann" || true
+          echo "===== LIBS from pkg-config ====="
+          pkg-config --libs spdlog libargon2 nlohmann_json openssl libcurl 2>&1 || true
 
-          MINGW_PREFIX=/usr/x86_64-w64-mingw32
-          BUILD_DIR=${{ github.workspace }}/deps-build
-          INSTALL_DIR=${{ github.workspace }}/deps-install
-
-          mkdir -p $BUILD_DIR $INSTALL_DIR/lib $INSTALL_DIR/include
-
-          echo "MINGW_PREFIX=${MINGW_PREFIX}" >> $GITHUB_ENV
-          echo "BUILD_DIR=${BUILD_DIR}" >> $GITHUB_ENV
-          echo "INSTALL_DIR=${INSTALL_DIR}" >> $GITHUB_ENV
-          echo "CROSS_CC=x86_64-w64-mingw32-gcc" >> $GITHUB_ENV
-          echo "CROSS_CXX=x86_64-w64-mingw32-g++" >> $GITHUB_ENV
-
-      - name: Build zlib (static, MinGW)
-        run: |
-          cd $BUILD_DIR
-          git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git
-          cd zlib
-          cmake -B build -G Ninja \
-            -DCMAKE_SYSTEM_NAME=Windows \
-            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
-            -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-          cmake --build build --config Release
-          cmake --install build
-
-      - name: Build OpenSSL (static, MinGW)
-        run: |
-          cd $BUILD_DIR
-          git clone --depth 1 --branch openssl-3.2.1 https://github.com/openssl/openssl.git
-          cd openssl
-          ./Configure mingw64 no-shared no-tests \
-            --cross-compile-prefix=x86_64-w64-mingw32- \
-            --prefix=$INSTALL_DIR \
-            --with-zlib-include=$INSTALL_DIR/include \
-            --with-zlib-lib=$INSTALL_DIR/lib
-          make -j$(nproc)
-          make install_sw
-
-      - name: Build libcurl (static, MinGW)
-        run: |
-          cd $BUILD_DIR
-          git clone --depth 1 --branch curl-8_6_0 https://github.com/curl/curl.git
-          cd curl
-          cmake -B build -G Ninja \
-            -DCMAKE_SYSTEM_NAME=Windows \
-            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
-            -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR \
-            -DCMAKE_PREFIX_PATH=$INSTALL_DIR \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DBUILD_CURL_EXE=OFF \
-            -DBUILD_TESTING=OFF \
-            -DCURL_USE_OPENSSL=ON \
-            -DOPENSSL_ROOT_DIR=$INSTALL_DIR \
-            -DCURL_ZLIB=ON \
-            -DZLIB_LIBRARY=$INSTALL_DIR/lib/libz.a \
-            -DZLIB_INCLUDE_DIR=$INSTALL_DIR/include \
-            -DCURL_USE_LIBSSH2=OFF \
-            -DCURL_USE_LIBPSL=OFF \
-            -DUSE_LIBIDN2=OFF \
-            -DCURL_DISABLE_LDAP=ON
-          cmake --build build --config Release
-          cmake --install build
-
-      - name: Build libargon2 (static, MinGW)
-        run: |
-          cd $BUILD_DIR
-          git clone --depth 1 https://github.com/P-H-C/phc-winner-argon2.git argon2
-          cd argon2
-          # Build static library with MinGW
-          x86_64-w64-mingw32-gcc -std=c89 -O2 -c src/argon2.c -Iinclude -o src/argon2.o
-          x86_64-w64-mingw32-gcc -std=c89 -O2 -c src/core.c -Iinclude -o src/core.o
-          x86_64-w64-mingw32-gcc -std=c89 -O2 -c src/blake2/blake2b.c -Iinclude -o src/blake2/blake2b.o
-          x86_64-w64-mingw32-gcc -std=c89 -O2 -c src/thread.c -Iinclude -o src/thread.o
-          x86_64-w64-mingw32-gcc -std=c89 -O2 -c src/encoding.c -Iinclude -o src/encoding.o
-          x86_64-w64-mingw32-gcc -std=c89 -O2 -c src/ref.c -Iinclude -o src/ref.o
-          x86_64-w64-mingw32-ar rcs libargon2.a src/argon2.o src/core.o src/blake2/blake2b.o src/thread.o src/encoding.o src/ref.o
-          cp libargon2.a $INSTALL_DIR/lib/
-          cp include/argon2.h $INSTALL_DIR/include/
-
-      - name: Install header-only libraries (Boost, spdlog, nlohmann_json, fmt)
-        run: |
-          cd $BUILD_DIR
-
-          # Boost (header-only subset: Asio + Beast)
-          git clone --depth 1 --branch boost-1.84.0 --recurse-submodules \
-            https://github.com/boostorg/boost.git
-          cd boost
-          ./bootstrap.sh
-          ./b2 headers
-          cp -r boost $INSTALL_DIR/include/
-          cd ..
-
-          # fmt
-          git clone --depth 1 --branch 10.2.1 https://github.com/fmtlib/fmt.git
-          cd fmt
-          cmake -B build -G Ninja \
-            -DCMAKE_SYSTEM_NAME=Windows \
-            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
-            -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DFMT_TEST=OFF \
-            -DFMT_DOC=OFF
-          cmake --build build --config Release
-          cmake --install build
-          cd ..
-
-          # spdlog (compiled, links to fmt)
-          git clone --depth 1 --branch v1.13.0 https://github.com/gabime/spdlog.git
-          cd spdlog
-          cmake -B build -G Ninja \
-            -DCMAKE_SYSTEM_NAME=Windows \
-            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
-            -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR \
-            -DCMAKE_PREFIX_PATH=$INSTALL_DIR \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DSPDLOG_BUILD_EXAMPLE=OFF \
-            -DSPDLOG_BUILD_TESTS=OFF \
-            -DSPDLOG_FMT_EXTERNAL=ON
-          cmake --build build --config Release
-          cmake --install build
-          cd ..
-
-          # nlohmann/json (header-only)
-          git clone --depth 1 --branch v3.11.3 https://github.com/nlohmann/json.git
-          cd json
-          cmake -B build -G Ninja \
-            -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR \
-            -DJSON_BuildTests=OFF
-          cmake --install build
-          cd ..
-
-      - name: Build phira-mp-server for Windows
-        run: |
-          INSTALL_DIR=${{ github.workspace }}/deps-install
-          DEPSLIB="$INSTALL_DIR/lib"
-          DEPSINC="$INSTALL_DIR/include"
-
-          # Build with explicit paths — no pkg-config for cross-compilation
-          make clean
           make -j$(nproc) \
-            CXX=x86_64-w64-mingw32-g++ \
             TARGET=phira-mp-server.exe \
-            CXXFLAGS="-std=c++20 -Wall -Wextra -O2 -DLOCALES_DIR=\\\"./locales\\\" \
-              -I${DEPSINC} -DCURL_STATICLIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_COMPILED_LIB" \
-            LDFLAGS="-static -static-libgcc -static-libstdc++" \
-            LIBS="-L${DEPSLIB} \
-              -lspdlog -lfmt \
-              -lcurl -lssl -lcrypto \
-              -largon2 \
-              -lz -lws2_32 -lcrypt32 -lwldap32 -lbcrypt \
-              -lrpcrt4 -lpthread"
+            LOCALES_DIR=\"./locales\"
 
           file phira-mp-server.exe
           ls -lh phira-mp-server.exe
 
-      - name: Package artifact
+      - name: Collect DLLs and package
         run: |
           mkdir -p release/phira-mp-server-windows-amd64
+
           cp phira-mp-server.exe release/phira-mp-server-windows-amd64/
+
+          # Collect every UCRT64 DLL the exe depends on (recursively)
+          collect_dlls() {
+            local binary="$1"
+            ldd "$binary" 2>/dev/null | grep -i '/ucrt64/' | awk '{print $3}' | while read -r dll; do
+              local base=$(basename "$dll")
+              if [ ! -f "release/phira-mp-server-windows-amd64/$base" ] && [ -f "$dll" ]; then
+                cp "$dll" release/phira-mp-server-windows-amd64/
+                # Recurse to catch transitive dependencies
+                collect_dlls "$dll"
+              fi
+            done
+          }
+          collect_dlls phira-mp-server.exe
+
           cp -r locales release/phira-mp-server-windows-amd64/
-          cd release
-          zip -r phira-mp-server-windows-amd64.zip phira-mp-server-windows-amd64/
+
+          echo "===== Package contents ====="
+          ls -la release/phira-mp-server-windows-amd64/
+
+      - name: Create zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path release/phira-mp-server-windows-amd64 -DestinationPath release/phira-mp-server-windows-amd64.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
