@@ -1,19 +1,18 @@
 # ✨cpp-phira-mp✨
 
-✨基于 [phira-mp](https://github.com/TeamFlos/phira-mp) 重新开发的C++版phira-mp，新增 Web 后台管理、REST API、SSE 实时事件、封禁系统、管理密码、WebSocket Secure 实时数据流和连接欢迎信息。✨
+✨基于 [phira-mp](https://github.com/TeamFlos/phira-mp) 重新开发的C++版phira-mp，新增 Web 后台管理、REST API、SSE 实时事件、封禁系统、适配观战系统和连接欢迎信息。✨
 
 ## 特点
 
 ### 1. 后台 Web 管理面板（含密码保护）
-- 浏览器访问 `http://服务器IP:12345/admin`
-- **登录认证**：首次运行默认密码 `admin123`，请立即修改
-- **密码管理**：面板内可直接修改管理密码，密码持久化存储于 `admin_password.txt`
+- 浏览器访问 `http://服务器IP:12347/admin` （默认情况下）
+- **登录认证**：首次运行默认密码 `admin`，请立即修改
 - 查看所有房间列表、房间状态、玩家人数及列表
 - 实时刷新（每5秒自动更新）
 - 一键解散任意房间
 - 一键踢出房间内任意玩家
 - 封禁/解封玩家 ID（封禁后连接时显示「你已被封禁」提示）
-- 封禁列表持久化存储在 `banned.txt`
+- 封禁列表持久化存储在 `banned_users.txt`
 
 ### 2. API
 
@@ -27,7 +26,7 @@
 #### SSE 事件类型
 | 事件 | 说明 |
 |------|------|
-| `snapshot` | 连接时自动发送当前所有房间快照 |
+| `keepalive` | 保持连接 |
 | `create_room` | 新房间创建 |
 | `update_room` | 房间数据更新（状态、铺面、锁定、轮换等变化） |
 | `join_room` | 用户加入房间 |
@@ -37,11 +36,10 @@
 
 SSE 连接内建 15 秒心跳保活机制，防止连接被中间件或防火墙断开。
 
-### 3. 本程序可搭配 [phira-web-monitor](https://github.com/HyperSynapseNetwork/phira-web/monitor)进行观战。
+### 3. 本程序可搭配 [Phira观战实现](https://github.com/HyperSynapseNetwork/phira-web-monitor)进行观战。
 
 ### 4. 连接欢迎信息
 - 用户认证成功后自动发送欢迎消息
-- 显示 QQ 群号：1049578201
 - 展示当前可加入的房间列表（仅显示选图中且未锁定的房间）
 
 ---
@@ -63,7 +61,13 @@ sudo apt install -y build-essential g++ pkg-config uuid-dev curl libssl-dev libb
 | uuid-dev | `uuid-dev` | UUID 生成 |
 | curl | `curl` | HTTP 请求（获取 Phira API 数据） |
 | make | `build-essential` | 构建工具 |
-| OpenSSL | `libssl-dev` | TLS/SSL 支持（WSS 服务） |
+| pkg-config | `pkg-config` | - |
+| Boost | `libboost-dev` | 所需依赖 |
+| spdlog | `libspdlog-dev` | 日志等级实现 |
+| Argon2 | `libargon2-dev` | 二进制协议 |
+| Json3 | `nlohmann-json3-dev` | Json3 |
+| Curl-OpenSSL | `libcurl4-openssl-dev` | Curl和OpenSSL实现 |
+| OpenSSL | `libssl-dev` | SSL 支持 |
 
 ---
 

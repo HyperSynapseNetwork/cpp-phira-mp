@@ -20,7 +20,8 @@ static std::string http_get(const std::string& url, const std::string& auth = ""
     struct curl_slist* hdrs = nullptr;
     if (!auth.empty()) { hdrs = curl_slist_append(hdrs, ("Authorization: " + auth).c_str()); curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs); }
     CURLcode rc = curl_easy_perform(c); long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-    if (hdrs) curl_slist_free_all(hdrs); curl_easy_cleanup(c);
+    if (hdrs) curl_slist_free_all(hdrs);
+    curl_easy_cleanup(c);
     if (rc != CURLE_OK) throw std::runtime_error(std::string("HTTP fail: ") + curl_easy_strerror(rc));
     if (code >= 400) throw std::runtime_error("HTTP " + std::to_string(code));
     return resp;
@@ -101,7 +102,9 @@ void Session::start_heartbeat() {
     hb_timer_ = std::make_shared<asio::steady_timer>(ioc_);
     auto ws = std::weak_ptr<Session>(shared_from_this()); auto srv = server_; auto sid = id;
     auto check = [ws, srv, sid](auto& self, const error_code& ec) {
-        if (ec) return; auto s = ws.lock(); if (!s) return;
+        if (ec) return;
+        auto s = ws.lock();
+        if (!s) return;
         auto now = std::chrono::steady_clock::now();
         std::chrono::steady_clock::time_point last;
         { std::lock_guard lk(s->last_recv_mu_); last = s->last_recv_; }
@@ -136,10 +139,10 @@ static void send_re(std::shared_ptr<ServerState> srv, RoomEvent ev) {
 static void send_welcome(std::shared_ptr<User> u, std::shared_ptr<ServerState> srv) {
     // Welcome messages
     { Message m; m.type = MessageType::Chat; m.user = 0;
-      m.content = "欢迎使用HSNPhira多人游戏服务器！";
+      m.content = "欢迎连接到Phira多人游戏服务器！";
       u->try_send(ServerCommand::make_message(m)); }
     { Message m; m.type = MessageType::Chat; m.user = 0;
-      m.content = "欢迎加入1049578201交流群获取更多咨讯！";
+      m.content = "想要查询房间？加入1049578201交流群即可查询！";
       u->try_send(ServerCommand::make_message(m)); }
 
     // Show available rooms (unlocked, in SelectChart state)
@@ -187,7 +190,7 @@ void Session::handle_auth(const ClientCommand& cmd) {
                     auto r2 = r;
                     if (srv->is_banned(r2.id)) {
                         spdlog::info("banned user {} tried to connect", r2.id);
-                        self->try_send(ServerCommand::make_auth_err("你已被管理员封禁，请加入交流群1049578201联系群主查看详情。"));
+                        self->try_send(ServerCommand::make_auth_err("You are banned from this server."));
                         self->panicked_.store(true);
                         srv->handle_lost_connection(sid);
                         return;
