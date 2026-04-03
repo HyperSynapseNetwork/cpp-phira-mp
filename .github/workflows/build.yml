@@ -1,4 +1,4 @@
-name: Build and Release
+name: Makefile CI
 
 on:
   push:
@@ -63,9 +63,12 @@ jobs:
                 zlib-static \
                 brotli-static \
                 nghttp2-static \
-                c-ares-static \
-                libidn2-static libunistring-static \
                 linux-headers
+
+              # Install optional static libs (some may not exist in all Alpine versions)
+              for pkg in c-ares-dev c-ares-static libidn2-dev libidn2-static libunistring-dev libunistring-static; do
+                apk add --no-cache "$pkg" 2>/dev/null || true
+              done
 
               # ── Check what static libcurl needs ──
               echo "=== pkg-config --static --libs libcurl ==="
