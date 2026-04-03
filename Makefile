@@ -12,7 +12,16 @@ SRCS := src/main.cpp src/binary.cpp src/command.cpp src/stream.cpp \
 
 OBJS := $(SRCS:.cpp=.o)
 
-# ── pkg-config detection (skip if LIBS already provided) ──────────────
+# ── Platform-specific libraries ───────────────────────────────────────
+# Windows (MSYS2 / MinGW): use rpcrt4 for UUID, ws2_32 for sockets
+# Linux: use libuuid
+ifeq ($(OS),Windows_NT)
+  PLATFORM_LIBS := -lrpcrt4 -lws2_32
+else
+  PLATFORM_LIBS := -luuid
+endif
+
+# ── pkg-config detection (skip if LIBS already provided externally) ───
 ifeq ($(LIBS),)
   ifeq ($(STATIC),1)
     PKG_FLAGS := $(shell pkg-config --static --cflags spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
@@ -22,7 +31,7 @@ ifeq ($(LIBS),)
     PKG_LIBS  := $(shell pkg-config --libs spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
   endif
   CXXFLAGS += $(PKG_FLAGS)
-  LIBS     := $(PKG_LIBS) -luuid -lpthread
+  LIBS     := $(PKG_LIBS) $(PLATFORM_LIBS) -lpthread
 endif
 
 ifeq ($(STATIC),1)
