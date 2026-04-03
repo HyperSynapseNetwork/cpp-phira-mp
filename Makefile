@@ -16,7 +16,7 @@ OBJS := $(SRCS:.cpp=.o)
 # Windows (MSYS2 / MinGW): use rpcrt4 for UUID, ws2_32 for sockets
 # Linux: use libuuid
 ifeq ($(OS),Windows_NT)
-  PLATFORM_LIBS := -lrpcrt4 -lws2_32
+  PLATFORM_LIBS := -lrpcrt4 -lws2_32 -lmswsock
 else
   PLATFORM_LIBS := -luuid
 endif
