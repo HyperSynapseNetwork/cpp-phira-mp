@@ -1,4 +1,5 @@
 name: Makefile CI
+
 on:
   push:
     branches: [ main, master ]
@@ -14,8 +15,8 @@ jobs:
   # ═══════════════════════════════════════════════════════════════════
   # Linux builds — Alpine Docker for fully-static musl binaries
   #
-  # Alpine splits static libs into separate *-static packages.
-  # Every -l<foo> used at link time needs the corresponding .a file.
+  # Alpine does NOT ship -static packages for spdlog / fmt / argon2,
+  # so we build them from source inside the container.
   # ═══════════════════════════════════════════════════════════════════
   build-linux:
     runs-on: ubuntu-latest
@@ -50,89 +51,139 @@ jobs:
             sh -c '
               set -ex
 
-              # ── Core build tools ──
+              # ══════════════════════════════════════════════════════
+              # 1. Build tools
+              # ══════════════════════════════════════════════════════
               apk add --no-cache \
-                build-base make pkgconf linux-headers
+                build-base make pkgconf cmake linux-headers \
+                wget tar xz
 
-              # ── Dev packages (headers + .so symlinks) ──
+              # ══════════════════════════════════════════════════════
+              # 2. Header-only libraries (from Alpine packages)
+              # ══════════════════════════════════════════════════════
+              apk add --no-cache boost-dev nlohmann-json
+
+              # ══════════════════════════════════════════════════════
+              # 3. Libraries that DO have -static packages in Alpine
+              # ══════════════════════════════════════════════════════
               apk add --no-cache \
-                boost-dev \
-                spdlog-dev \
-                fmt-dev \
-                nlohmann-json \
-                openssl-dev \
-                curl-dev \
-                argon2-dev \
-                util-linux-dev \
-                zlib-dev \
-                brotli-dev \
-                nghttp2-dev \
-                zstd-dev
+                openssl-dev   openssl-libs-static \
+                curl-dev      curl-static \
+                zlib-dev      zlib-static \
+                brotli-dev    brotli-static \
+                nghttp2-dev   nghttp2-static
 
-              # ── Matching -static packages (provides .a files) ──
-              # These are REQUIRED for -static linking on Alpine.
-              apk add --no-cache \
-                openssl-libs-static \
-                curl-static \
-                zlib-static \
-                brotli-static \
-                nghttp2-static \
-                zstd-static \
-                spdlog-static \
-                fmt-static
-
-              # ── Optional -static packages (may not exist on all Alpine versions) ──
-              # Each installed individually so a missing one does not block the rest.
+              # Optional transitive deps of libcurl (try each individually)
               for pkg in \
-                argon2-static \
-                util-linux-static \
+                zstd-dev zstd-static \
                 libpsl-dev libpsl-static \
                 libidn2-dev libidn2-static \
                 libunistring-dev libunistring-static \
                 c-ares-dev c-ares-static
               do
-                apk add --no-cache "$pkg" 2>/dev/null || echo "SKIP (not found): $pkg"
+                apk add --no-cache "$pkg" 2>/dev/null || echo "SKIP: $pkg"
               done
 
-              # ── Diagnostics ──
-              echo "===== pkg-config --static --libs libcurl ====="
-              pkg-config --static --libs libcurl || true
-              echo "===== pkg-config --static --libs spdlog ====="
-              pkg-config --static --libs spdlog || true
-              echo "===== Checking .a files ====="
-              ls /usr/lib/libspdlog.a /usr/lib/libfmt.a /usr/lib/libargon2.a /usr/lib/libuuid.a 2>&1 || true
-              ls /usr/lib/libcurl.a /usr/lib/libssl.a /usr/lib/libcrypto.a /usr/lib/libz.a 2>&1 || true
+              # ══════════════════════════════════════════════════════
+              # 4. Build fmt from source (Alpine has NO fmt-static)
+              # ══════════════════════════════════════════════════════
+              cd /tmp
+              wget -q https://github.com/fmtlib/fmt/archive/refs/tags/10.2.1.tar.gz -O fmt.tar.gz
+              tar xf fmt.tar.gz && cd fmt-10.2.1
+              cmake -B build \
+                -DCMAKE_INSTALL_PREFIX=/usr \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_SHARED_LIBS=OFF \
+                -DFMT_TEST=OFF \
+                -DFMT_DOC=OFF
+              cmake --build build -j$(nproc)
+              cmake --install build
 
-              # ── If argon2 static lib is still missing, build from source ──
-              if [ ! -f /usr/lib/libargon2.a ]; then
-                echo ">> Building libargon2.a from source"
-                cd /tmp
-                wget -q https://github.com/P-H-C/phc-winner-argon2/archive/refs/tags/20190702.tar.gz
-                tar xf 20190702.tar.gz && cd phc-winner-argon2-20190702
-                make -j$(nproc) LIBRARY_REL=lib ARGON2_BUILD_DIR=/usr install
-                cd /workspace
-              fi
+              # ══════════════════════════════════════════════════════
+              # 5. Build spdlog from source (Alpine has NO spdlog-static)
+              # ══════════════════════════════════════════════════════
+              cd /tmp
+              wget -q https://github.com/gabime/spdlog/archive/refs/tags/v1.14.1.tar.gz -O spdlog.tar.gz
+              tar xf spdlog.tar.gz && cd spdlog-1.14.1
+              cmake -B build \
+                -DCMAKE_INSTALL_PREFIX=/usr \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_SHARED_LIBS=OFF \
+                -DSPDLOG_BUILD_EXAMPLE=OFF \
+                -DSPDLOG_BUILD_TESTS=OFF \
+                -DSPDLOG_FMT_EXTERNAL=ON
+              cmake --build build -j$(nproc)
+              cmake --install build
 
-              # ── If libuuid static lib is still missing, build from source ──
+              # ══════════════════════════════════════════════════════
+              # 6. Build libargon2 from source (no -static package)
+              # ══════════════════════════════════════════════════════
+              cd /tmp
+              wget -q https://github.com/P-H-C/phc-winner-argon2/archive/refs/tags/20190702.tar.gz -O argon2.tar.gz
+              tar xf argon2.tar.gz && cd phc-winner-argon2-20190702
+              cc -std=c89 -O2 -c src/argon2.c    -Iinclude -o src/argon2.o
+              cc -std=c89 -O2 -c src/core.c      -Iinclude -o src/core.o
+              cc -std=c89 -O2 -c src/blake2/blake2b.c -Iinclude -o src/blake2/blake2b.o
+              cc -std=c89 -O2 -c src/thread.c    -Iinclude -o src/thread.o
+              cc -std=c89 -O2 -c src/encoding.c  -Iinclude -o src/encoding.o
+              cc -std=c89 -O2 -c src/ref.c       -Iinclude -o src/ref.o
+              ar rcs libargon2.a src/argon2.o src/core.o src/blake2/blake2b.o \
+                src/thread.o src/encoding.o src/ref.o
+              cp libargon2.a /usr/lib/
+              cp include/argon2.h /usr/include/
+              cat > /usr/lib/pkgconfig/libargon2.pc << PC
+          prefix=/usr
+          libdir=\${prefix}/lib
+          includedir=\${prefix}/include
+          Name: libargon2
+          Description: Argon2 password hashing library
+          Version: 20190702
+          Libs: -L\${libdir} -largon2
+          Cflags: -I\${includedir}
+          PC
+
+              # ══════════════════════════════════════════════════════
+              # 7. Build libuuid static if missing
+              # ══════════════════════════════════════════════════════
+              apk add --no-cache util-linux-dev 2>/dev/null || true
               if [ ! -f /usr/lib/libuuid.a ]; then
                 echo ">> Building libuuid.a from source"
                 cd /tmp
-                apk add --no-cache autoconf automake libtool gettext-dev
-                wget -q https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.40/util-linux-2.40.tar.xz
-                tar xf util-linux-2.40.tar.xz && cd util-linux-2.40
-                ./configure --disable-all-programs --enable-libuuid --enable-static --disable-shared --prefix=/usr
-                make -j$(nproc) && make install
-                cd /workspace
+                apk add --no-cache autoconf automake libtool gettext-dev bison
+                wget -q https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.40/util-linux-2.40.2.tar.xz -O util-linux.tar.xz
+                tar xf util-linux.tar.xz && cd util-linux-2.40.2
+                ./configure --disable-all-programs --enable-libuuid \
+                  --enable-static --disable-shared --prefix=/usr
+                make -j$(nproc)
+                make install
               fi
 
-              # ── Build the project ──
+              # ══════════════════════════════════════════════════════
+              # 8. Diagnostics
+              # ══════════════════════════════════════════════════════
+              echo "===== Verifying static libraries ====="
+              for lib in spdlog fmt argon2 uuid curl ssl crypto z zstd brotlidec brotlicommon nghttp2; do
+                [ -f /usr/lib/lib${lib}.a ] && echo "OK   /usr/lib/lib${lib}.a" || echo "MISS /usr/lib/lib${lib}.a"
+              done
+
+              echo "===== pkg-config --static --libs libcurl ====="
+              pkg-config --static --libs libcurl 2>&1 || true
+              echo "===== pkg-config --static --libs spdlog ====="
+              pkg-config --static --libs spdlog 2>&1 || true
+
+              # ══════════════════════════════════════════════════════
+              # 9. Build the project
+              # ══════════════════════════════════════════════════════
+              cd /workspace
               make clean
               make -j$(nproc) \
                 STATIC=1 \
                 LOCALES_DIR=\"./locales\" \
                 TARGET=phira-mp-server
 
-              # ── Verify ──
+              # ══════════════════════════════════════════════════════
+              # 10. Verify
+              # ══════════════════════════════════════════════════════
               file phira-mp-server
               ls -lh phira-mp-server
             '
@@ -182,28 +233,33 @@ jobs:
 
       - name: Install or build argon2
         run: |
-          # Try installing from MSYS2 repo first
-          pacman -S --noconfirm mingw-w64-ucrt-x86_64-argon2 2>/dev/null && exit 0
+          # Try the MSYS2 package first
+          pacman -S --noconfirm mingw-w64-ucrt-x86_64-argon2 2>/dev/null && {
+            echo "argon2 installed from MSYS2 repo"
+            exit 0
+          }
 
-          echo ">> argon2 not in repo, building from source"
+          echo ">> Building argon2 from source for MinGW"
           cd /tmp
           curl -sL https://github.com/P-H-C/phc-winner-argon2/archive/refs/tags/20190702.tar.gz | tar xz
           cd phc-winner-argon2-20190702
-          gcc -std=c89 -O2 -c src/argon2.c -Iinclude -o src/argon2.o
-          gcc -std=c89 -O2 -c src/core.c -Iinclude -o src/core.o
+          gcc -std=c89 -O2 -c src/argon2.c      -Iinclude -o src/argon2.o
+          gcc -std=c89 -O2 -c src/core.c        -Iinclude -o src/core.o
           gcc -std=c89 -O2 -c src/blake2/blake2b.c -Iinclude -o src/blake2/blake2b.o
-          gcc -std=c89 -O2 -c src/thread.c -Iinclude -o src/thread.o
-          gcc -std=c89 -O2 -c src/encoding.c -Iinclude -o src/encoding.o
-          gcc -std=c89 -O2 -c src/ref.c -Iinclude -o src/ref.o
-          ar rcs libargon2.a src/argon2.o src/core.o src/blake2/blake2b.o src/thread.o src/encoding.o src/ref.o
+          gcc -std=c89 -O2 -c src/thread.c      -Iinclude -o src/thread.o
+          gcc -std=c89 -O2 -c src/encoding.c    -Iinclude -o src/encoding.o
+          gcc -std=c89 -O2 -c src/ref.c         -Iinclude -o src/ref.o
+          ar rcs libargon2.a src/argon2.o src/core.o src/blake2/blake2b.o \
+            src/thread.o src/encoding.o src/ref.o
           cp libargon2.a /ucrt64/lib/
           cp include/argon2.h /ucrt64/include/
-          # Create a pkg-config file
+
+          # Create pkg-config file so Makefile can find it
+          mkdir -p /ucrt64/lib/pkgconfig
           cat > /ucrt64/lib/pkgconfig/libargon2.pc << 'PC'
           prefix=/ucrt64
           libdir=${prefix}/lib
           includedir=${prefix}/include
-
           Name: libargon2
           Description: Argon2 password hashing library
           Version: 20190702
@@ -214,8 +270,6 @@ jobs:
       - name: Build
         run: |
           echo "===== pkg-config diagnostics ====="
-          pkg-config --list-all | grep -iE "argon|spdlog|curl|openssl|nlohmann" || true
-          echo "===== LIBS from pkg-config ====="
           pkg-config --libs spdlog libargon2 nlohmann_json openssl libcurl 2>&1 || true
 
           make -j$(nproc) \
@@ -231,14 +285,15 @@ jobs:
 
           cp phira-mp-server.exe release/phira-mp-server-windows-amd64/
 
-          # Collect every UCRT64 DLL the exe depends on (recursively)
+          # ── Recursively collect every UCRT64 DLL the exe needs ──
           collect_dlls() {
             local binary="$1"
             ldd "$binary" 2>/dev/null | grep -i '/ucrt64/' | awk '{print $3}' | while read -r dll; do
-              local base=$(basename "$dll")
+              [ -z "$dll" ] && continue
+              local base
+              base=$(basename "$dll")
               if [ ! -f "release/phira-mp-server-windows-amd64/$base" ] && [ -f "$dll" ]; then
                 cp "$dll" release/phira-mp-server-windows-amd64/
-                # Recurse to catch transitive dependencies
                 collect_dlls "$dll"
               fi
             done
