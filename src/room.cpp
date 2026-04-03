@@ -56,18 +56,12 @@ bool Room::add_user(std::weak_ptr<User> u, bool mon) {
 }
 
 std::vector<std::shared_ptr<User>> Room::get_users() {
-    std::shared_lock lk(users_mu_);
-    std::vector<std::shared_ptr<User>> r;
-    for (auto& w : users_)
-        if (auto s = w.lock()) r.push_back(s);
-    return r;
+    std::shared_lock lk(users_mu_); std::vector<std::shared_ptr<User>> r;
+    for (auto& w : users_) if (auto s = w.lock()) r.push_back(s); return r;
 }
 std::vector<std::shared_ptr<User>> Room::get_monitors() {
-    std::shared_lock lk(monitors_mu_);
-    std::vector<std::shared_ptr<User>> r;
-    for (auto& w : monitors_)
-        if (auto s = w.lock()) r.push_back(s);
-    return r;
+    std::shared_lock lk(monitors_mu_); std::vector<std::shared_ptr<User>> r;
+    for (auto& w : monitors_) if (auto s = w.lock()) r.push_back(s); return r;
 }
 void Room::check_host_throw(const User& u) {
     std::shared_lock lk(host_mu); auto h = host.lock();

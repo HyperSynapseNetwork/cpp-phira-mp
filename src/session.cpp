@@ -17,22 +17,10 @@ static std::string http_get(const std::string& url, const std::string& auth = ""
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
-#ifdef _WIN32
-    // On Windows the deployed binary is outside the MSYS2 tree, so
-    // OpenSSL cannot find a CA bundle.  CURLSSLOPT_NATIVE_CA (curl
-    // 8.2.0+) tells curl to fall back to the Windows certificate store.
-#ifdef CURLSSLOPT_NATIVE_CA
-    curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
-#else
-    // Older curl: try a bundled cacert.pem next to the executable
-    curl_easy_setopt(c, CURLOPT_CAINFO, "cacert.pem");
-#endif
-#endif
     struct curl_slist* hdrs = nullptr;
     if (!auth.empty()) { hdrs = curl_slist_append(hdrs, ("Authorization: " + auth).c_str()); curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs); }
     CURLcode rc = curl_easy_perform(c); long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-    if (hdrs) curl_slist_free_all(hdrs);
-    curl_easy_cleanup(c);
+    if (hdrs) curl_slist_free_all(hdrs); curl_easy_cleanup(c);
     if (rc != CURLE_OK) throw std::runtime_error(std::string("HTTP fail: ") + curl_easy_strerror(rc));
     if (code >= 400) throw std::runtime_error("HTTP " + std::to_string(code));
     return resp;
@@ -113,9 +101,7 @@ void Session::start_heartbeat() {
     hb_timer_ = std::make_shared<asio::steady_timer>(ioc_);
     auto ws = std::weak_ptr<Session>(shared_from_this()); auto srv = server_; auto sid = id;
     auto check = [ws, srv, sid](auto& self, const error_code& ec) {
-        if (ec) return;
-        auto s = ws.lock();
-        if (!s) return;
+        if (ec) return; auto s = ws.lock(); if (!s) return;
         auto now = std::chrono::steady_clock::now();
         std::chrono::steady_clock::time_point last;
         { std::lock_guard lk(s->last_recv_mu_); last = s->last_recv_; }

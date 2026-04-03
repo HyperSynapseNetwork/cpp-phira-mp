@@ -1,9 +1,7 @@
 #include "binary.hpp"
 #ifdef _WIN32
 #include <rpc.h>
-#ifdef _MSC_VER
 #pragma comment(lib, "rpcrt4.lib")
-#endif
 #else
 #include <uuid/uuid.h>
 #endif
