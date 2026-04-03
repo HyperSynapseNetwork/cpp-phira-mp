@@ -1,4 +1,4 @@
-name: Makefile CI
+name: Build and Release
 
 on:
   push:
@@ -149,11 +149,11 @@ jobs:
               if [ ! -f /usr/lib/libuuid.a ]; then
                 echo ">> Building libuuid.a from source"
                 cd /tmp
-                apk add --no-cache autoconf automake libtool gettext-dev bison
+                apk add --no-cache autoconf automake libtool bison
                 wget -q https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.40/util-linux-2.40.2.tar.xz -O util-linux.tar.xz
                 tar xf util-linux.tar.xz && cd util-linux-2.40.2
                 ./configure --disable-all-programs --enable-libuuid \
-                  --enable-static --disable-shared --prefix=/usr
+                  --enable-static --disable-shared --disable-nls --prefix=/usr
                 make -j$(nproc)
                 make install
               fi
