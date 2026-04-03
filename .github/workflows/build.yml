@@ -1,11 +1,11 @@
-name: Makefile CI
+name: Build and Release
 
 on:
   push:
-    branches:
-      - main
-    tags:
-      - 'v*'
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
 
 permissions:
@@ -13,281 +13,312 @@ permissions:
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════
-  # Linux builds — fully static (native amd64 + cross arm64/armhf)
-  #
-  # Ubuntu 24.04's system libcurl.a is compiled with SSH, Kerberos,
-  # LDAP and RTMP — none of which ship static .a archives.  We therefore
-  # build libcurl (plus fmt and spdlog) from source with only the
-  # features we need, so `-static` linking works cleanly.
+  # Linux builds — use Alpine Docker for reliable static linking
+  # Alpine uses musl libc and provides *-static packages, making
+  # fully static binaries straightforward.
   # ═══════════════════════════════════════════════════════════════════
   build-linux:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
-            triplet: x86_64-linux-gnu
-            pkg_arch: amd64
-            cc: gcc
-            cxx: g++
+            platform: linux/amd64
+            artifact: phira-mp-server-linux-amd64
           - arch: arm64
-            triplet: aarch64-linux-gnu
-            pkg_arch: arm64
-            cc: aarch64-linux-gnu-gcc
-            cxx: aarch64-linux-gnu-g++
+            platform: linux/arm64
+            artifact: phira-mp-server-linux-arm64
           - arch: armhf
-            triplet: arm-linux-gnueabihf
-            pkg_arch: armhf
-            cc: arm-linux-gnueabihf-gcc
-            cxx: arm-linux-gnueabihf-g++
-
-    env:
-      # Where from-source static libs are installed
-      STATIC_PREFIX: /opt/static-${{ matrix.arch }}
+            platform: linux/arm/v7
+            artifact: phira-mp-server-linux-armhf
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Enable multiarch
+      - name: Set up QEMU (for cross-architecture builds)
         if: matrix.arch != 'amd64'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build static binary in Alpine container
         run: |
-          sudo dpkg --add-architecture ${{ matrix.pkg_arch }}
-          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-            sudo sed -i 's/^Types: deb$/Types: deb\nArchitectures: amd64/' /etc/apt/sources.list.d/ubuntu.sources
-          fi
-          if [ -f /etc/apt/sources.list ]; then
-            sudo sed -i 's|^deb http|deb [arch=amd64] http|g' /etc/apt/sources.list
-          fi
-          cat <<EOF | sudo tee /etc/apt/sources.list.d/multiarch.list > /dev/null
-          deb [arch=${{ matrix.pkg_arch }}] http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
-          deb [arch=${{ matrix.pkg_arch }}] http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse
-          deb [arch=${{ matrix.pkg_arch }}] http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse
-          EOF
-          sudo apt-get update -qq
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            alpine:3.21 \
+            sh -c '
+              set -ex
 
-      - name: Install toolchain & system static libs
+              # ── Install build dependencies ──
+              apk add --no-cache \
+                build-base make pkgconf \
+                boost-dev \
+                spdlog-dev fmt-dev \
+                nlohmann-json \
+                openssl-dev openssl-libs-static \
+                curl-dev curl-static \
+                argon2-dev \
+                util-linux-dev \
+                zlib-static \
+                brotli-static \
+                nghttp2-static \
+                c-ares-static \
+                libidn2-static libunistring-static \
+                linux-headers
+
+              # ── Check what static libcurl needs ──
+              echo "=== pkg-config --static --libs libcurl ==="
+              pkg-config --static --libs libcurl || true
+
+              # ── Build with LOCALES_DIR set to relative path ──
+              make clean
+              make -j$(nproc) \
+                STATIC=1 \
+                LOCALES_DIR=\"./locales\" \
+                TARGET=phira-mp-server
+
+              # ── Verify the binary ──
+              file phira-mp-server
+              ls -lh phira-mp-server
+            '
+
+      - name: Package artifact
         run: |
-          sudo apt-get update -qq
-          # Libs that DO ship .a on Ubuntu (no curl, spdlog, fmt here)
-          if [ "${{ matrix.arch }}" = "amd64" ]; then
-            sudo apt-get install -y -qq \
-              g++ cmake pkg-config \
-              libboost-dev libssl-dev \
-              libargon2-dev nlohmann-json3-dev uuid-dev \
-              zlib1g-dev libnghttp2-dev libbrotli-dev libzstd-dev \
-              libpsl-dev libidn2-dev libunistring-dev
-          else
-            sudo apt-get install -y -qq \
-              g++-${{ matrix.triplet }} cmake pkg-config \
-              libboost-dev:${{ matrix.pkg_arch }} \
-              libssl-dev:${{ matrix.pkg_arch }} \
-              libargon2-dev:${{ matrix.pkg_arch }} \
-              nlohmann-json3-dev:${{ matrix.pkg_arch }} \
-              uuid-dev:${{ matrix.pkg_arch }} \
-              zlib1g-dev:${{ matrix.pkg_arch }} \
-              libnghttp2-dev:${{ matrix.pkg_arch }} \
-              libbrotli-dev:${{ matrix.pkg_arch }} \
-              libzstd-dev:${{ matrix.pkg_arch }} \
-              libpsl-dev:${{ matrix.pkg_arch }} \
-              libidn2-dev:${{ matrix.pkg_arch }} \
-              libunistring-dev:${{ matrix.pkg_arch }}
-          fi
+          mkdir -p release/${{ matrix.artifact }}
+          cp phira-mp-server release/${{ matrix.artifact }}/
+          cp -r locales release/${{ matrix.artifact }}/
+          cd release
+          tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}/
 
-      - name: Build static deps from source (fmt, spdlog, curl)
-        run: |
-          set -e
-          sudo mkdir -p $STATIC_PREFIX
-
-          # ── Cross-compile helpers ──
-          if [ "${{ matrix.arch }}" = "amd64" ]; then
-            CM_CROSS=""
-            CURL_HOST=""
-            SYSLIB=/usr/lib/x86_64-linux-gnu
-          else
-            CM_CROSS="-DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DCMAKE_SYSTEM_NAME=Linux"
-            case "${{ matrix.arch }}" in
-              arm64) CURL_HOST="--host=aarch64-linux-gnu" ;;
-              armhf) CURL_HOST="--host=arm-linux-gnueabihf" ;;
-            esac
-            SYSLIB=/usr/lib/${{ matrix.triplet }}
-          fi
-
-          # ── fmt 9.1.0 ──
-          git clone --depth 1 --branch 9.1.0 https://github.com/fmtlib/fmt.git /tmp/fmt
-          cmake -S /tmp/fmt -B /tmp/fmt/build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=$STATIC_PREFIX \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DFMT_DOC=OFF -DFMT_TEST=OFF \
-            -DBUILD_SHARED_LIBS=OFF \
-            $CM_CROSS
-          cmake --build /tmp/fmt/build -j$(nproc)
-          sudo cmake --install /tmp/fmt/build
-
-          # ── spdlog 1.12.0 ──
-          git clone --depth 1 --branch v1.12.0 https://github.com/gabime/spdlog.git /tmp/spdlog
-          cmake -S /tmp/spdlog -B /tmp/spdlog/build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=$STATIC_PREFIX \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DSPDLOG_BUILD_SHARED=OFF \
-            -DSPDLOG_FMT_EXTERNAL=ON \
-            -DSPDLOG_BUILD_EXAMPLE=OFF -DSPDLOG_BUILD_TESTS=OFF \
-            -DCMAKE_PREFIX_PATH=$STATIC_PREFIX \
-            $CM_CROSS
-          cmake --build /tmp/spdlog/build -j$(nproc)
-          sudo cmake --install /tmp/spdlog/build
-
-          # ── curl 8.5.0 (minimal: only HTTP/HTTPS, no SSH/GSSAPI/LDAP/RTMP/PSL) ──
-          git clone --depth 1 --branch curl-8_5_0 https://github.com/curl/curl.git /tmp/curl
-          cd /tmp/curl
-          autoreconf -fi
-          # Tell configure where to find cross-arch OpenSSL, nghttp2 etc.
-          PKG_CONFIG_LIBDIR="${SYSLIB}/pkgconfig:/usr/share/pkgconfig" \
-          CC="${{ matrix.cc }}" \
-          ./configure \
-            $CURL_HOST \
-            --prefix=$STATIC_PREFIX \
-            --disable-shared --enable-static \
-            --with-openssl \
-            --with-nghttp2 \
-            --with-zstd \
-            --with-brotli \
-            --without-libpsl \
-            --without-libssh --without-libssh2 \
-            --without-gssapi \
-            --without-libidn2 \
-            --without-librtmp \
-            --disable-ldap --disable-ldaps \
-            --disable-rtsp \
-            --disable-dict --disable-telnet --disable-tftp \
-            --disable-pop3 --disable-imap --disable-smb --disable-smtp \
-            --disable-gopher --disable-mqtt \
-            --disable-manual --disable-docs \
-            --disable-ntlm \
-            --silent
-          make -j$(nproc) V=0
-          sudo make install
-          cd -
-
-      - name: Build
-        env:
-          CC: ${{ matrix.cc }}
-          CXX: ${{ matrix.cxx }}
-        run: |
-          if [ "${{ matrix.arch }}" = "amd64" ]; then
-            make -j$(nproc) STATIC=1 STATIC_PREFIX=$STATIC_PREFIX
-          else
-            export PKG_CONFIG_LIBDIR=/usr/lib/${{ matrix.triplet }}/pkgconfig:/usr/share/pkgconfig:$STATIC_PREFIX/lib/pkgconfig
-            export PKG_CONFIG_SYSROOT_DIR=/
-            make -j$(nproc) CXX=${{ matrix.cxx }} STATIC=1 STATIC_PREFIX=$STATIC_PREFIX
-          fi
-          strip phira-mp-server || ${{ matrix.triplet }}-strip phira-mp-server || true
-
-      - name: Verify static
-        run: |
-          file phira-mp-server
-          ldd phira-mp-server 2>&1 || echo "(expected: not a dynamic executable)"
-
-      - name: Package
-        run: |
-          mkdir -p dist
-          cp phira-mp-server dist/
-          cp -r locales dist/
-          tar czf phira-mp-server-linux-${{ matrix.arch }}.tar.gz -C dist .
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: phira-mp-server-linux-${{ matrix.arch }}
-          path: phira-mp-server-linux-${{ matrix.arch }}.tar.gz
+          name: ${{ matrix.artifact }}
+          path: release/${{ matrix.artifact }}.tar.gz
 
   # ═══════════════════════════════════════════════════════════════════
-  # Windows amd64 (MSYS2 UCRT64) — dynamic
+  # Windows amd64 — cross-compile with MinGW-w64 on Ubuntu
   # ═══════════════════════════════════════════════════════════════════
   build-windows:
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: msys2/setup-msys2@v2
-        with:
-          msystem: UCRT64
-          update: true
-          install: >-
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-make
-            mingw-w64-ucrt-x86_64-pkg-config
-            mingw-w64-ucrt-x86_64-boost
-            mingw-w64-ucrt-x86_64-curl
-            mingw-w64-ucrt-x86_64-openssl
-            mingw-w64-ucrt-x86_64-spdlog
-            mingw-w64-ucrt-x86_64-argon2
-            mingw-w64-ucrt-x86_64-nlohmann-json
-            mingw-w64-ucrt-x86_64-fmt
-      - name: Build
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 and base tools
         run: |
-          cat > Makefile.win << 'MF'
-          CXX      := g++
-          CXXFLAGS := -std=c++20 -Wall -Wextra -O2 -pthread -DWIN32_LEAN_AND_MEAN
-          CXXFLAGS += -Wno-array-bounds -Wno-stringop-overflow
-          INCLUDES := -Iinclude
-          CXXFLAGS += $(shell pkg-config --cflags spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
-          LIBS := $(shell pkg-config --libs spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null) \
-                  -lfmt -lrpcrt4 -lws2_32 -lwsock32 -lpthread
-          SRCS := src/main.cpp src/binary.cpp src/command.cpp src/stream.cpp \
-                  src/l10n.cpp src/room.cpp src/session.cpp src/server.cpp \
-                  src/http_server.cpp
-          OBJS := $(SRCS:.cpp=.o)
-          TARGET := phira-mp-server.exe
-          LOCALES_DIR := locales
-          CXXFLAGS += -DLOCALES_DIR=\"$(LOCALES_DIR)\"
-          .PHONY: all clean
-          all: $(TARGET)
-          $(TARGET): $(OBJS)
-          	$(CXX) $(CXXFLAGS) -o $@ $^ $(LIBS)
-          src/%.o: src/%.cpp
-          	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<
-          clean:
-          	rm -f $(OBJS) $(TARGET)
-          MF
-          mingw32-make -f Makefile.win -j$(nproc)
-          strip phira-mp-server.exe || true
-      - name: Package
+          sudo apt-get update
+          sudo apt-get install -y \
+            g++-mingw-w64-x86-64 \
+            mingw-w64-x86-64-dev \
+            mingw-w64-tools \
+            make pkg-config \
+            cmake ninja-build \
+            git ca-certificates \
+            python3 perl
+
+      - name: Set MinGW environment
         run: |
-          mkdir -p dist
-          cp phira-mp-server.exe dist/
-          cp -r locales dist/
-          for dll in $(ldd phira-mp-server.exe 2>/dev/null | grep ucrt64 | awk '{print $3}'); do
-            cp "$dll" dist/ 2>/dev/null || true
-          done
-      - name: Create zip
-        shell: pwsh
-        run: Compress-Archive -Path dist\* -DestinationPath phira-mp-server-windows-amd64.zip
-      - uses: actions/upload-artifact@v4
+          echo "Setting up cross-compilation environment..."
+          # Use POSIX threading model
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix 2>/dev/null || true
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix 2>/dev/null || true
+
+          MINGW_PREFIX=/usr/x86_64-w64-mingw32
+          BUILD_DIR=${{ github.workspace }}/deps-build
+          INSTALL_DIR=${{ github.workspace }}/deps-install
+
+          mkdir -p $BUILD_DIR $INSTALL_DIR/lib $INSTALL_DIR/include
+
+          echo "MINGW_PREFIX=${MINGW_PREFIX}" >> $GITHUB_ENV
+          echo "BUILD_DIR=${BUILD_DIR}" >> $GITHUB_ENV
+          echo "INSTALL_DIR=${INSTALL_DIR}" >> $GITHUB_ENV
+          echo "CROSS_CC=x86_64-w64-mingw32-gcc" >> $GITHUB_ENV
+          echo "CROSS_CXX=x86_64-w64-mingw32-g++" >> $GITHUB_ENV
+
+      - name: Build zlib (static, MinGW)
+        run: |
+          cd $BUILD_DIR
+          git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git
+          cd zlib
+          cmake -B build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+            -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+          cmake --build build --config Release
+          cmake --install build
+
+      - name: Build OpenSSL (static, MinGW)
+        run: |
+          cd $BUILD_DIR
+          git clone --depth 1 --branch openssl-3.2.1 https://github.com/openssl/openssl.git
+          cd openssl
+          ./Configure mingw64 no-shared no-tests \
+            --cross-compile-prefix=x86_64-w64-mingw32- \
+            --prefix=$INSTALL_DIR \
+            --with-zlib-include=$INSTALL_DIR/include \
+            --with-zlib-lib=$INSTALL_DIR/lib
+          make -j$(nproc)
+          make install_sw
+
+      - name: Build libcurl (static, MinGW)
+        run: |
+          cd $BUILD_DIR
+          git clone --depth 1 --branch curl-8_6_0 https://github.com/curl/curl.git
+          cd curl
+          cmake -B build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+            -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR \
+            -DCMAKE_PREFIX_PATH=$INSTALL_DIR \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_CURL_EXE=OFF \
+            -DBUILD_TESTING=OFF \
+            -DCURL_USE_OPENSSL=ON \
+            -DOPENSSL_ROOT_DIR=$INSTALL_DIR \
+            -DCURL_ZLIB=ON \
+            -DZLIB_LIBRARY=$INSTALL_DIR/lib/libz.a \
+            -DZLIB_INCLUDE_DIR=$INSTALL_DIR/include \
+            -DCURL_USE_LIBSSH2=OFF \
+            -DCURL_USE_LIBPSL=OFF \
+            -DUSE_LIBIDN2=OFF \
+            -DCURL_DISABLE_LDAP=ON
+          cmake --build build --config Release
+          cmake --install build
+
+      - name: Build libargon2 (static, MinGW)
+        run: |
+          cd $BUILD_DIR
+          git clone --depth 1 https://github.com/P-H-C/phc-winner-argon2.git argon2
+          cd argon2
+          # Build static library with MinGW
+          x86_64-w64-mingw32-gcc -std=c89 -O2 -c src/argon2.c -Iinclude -o src/argon2.o
+          x86_64-w64-mingw32-gcc -std=c89 -O2 -c src/core.c -Iinclude -o src/core.o
+          x86_64-w64-mingw32-gcc -std=c89 -O2 -c src/blake2/blake2b.c -Iinclude -o src/blake2/blake2b.o
+          x86_64-w64-mingw32-gcc -std=c89 -O2 -c src/thread.c -Iinclude -o src/thread.o
+          x86_64-w64-mingw32-gcc -std=c89 -O2 -c src/encoding.c -Iinclude -o src/encoding.o
+          x86_64-w64-mingw32-gcc -std=c89 -O2 -c src/ref.c -Iinclude -o src/ref.o
+          x86_64-w64-mingw32-ar rcs libargon2.a src/argon2.o src/core.o src/blake2/blake2b.o src/thread.o src/encoding.o src/ref.o
+          cp libargon2.a $INSTALL_DIR/lib/
+          cp include/argon2.h $INSTALL_DIR/include/
+
+      - name: Install header-only libraries (Boost, spdlog, nlohmann_json, fmt)
+        run: |
+          cd $BUILD_DIR
+
+          # Boost (header-only subset: Asio + Beast)
+          git clone --depth 1 --branch boost-1.84.0 --recurse-submodules \
+            https://github.com/boostorg/boost.git
+          cd boost
+          ./bootstrap.sh
+          ./b2 headers
+          cp -r boost $INSTALL_DIR/include/
+          cd ..
+
+          # fmt
+          git clone --depth 1 --branch 10.2.1 https://github.com/fmtlib/fmt.git
+          cd fmt
+          cmake -B build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+            -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DFMT_TEST=OFF \
+            -DFMT_DOC=OFF
+          cmake --build build --config Release
+          cmake --install build
+          cd ..
+
+          # spdlog (compiled, links to fmt)
+          git clone --depth 1 --branch v1.13.0 https://github.com/gabime/spdlog.git
+          cd spdlog
+          cmake -B build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+            -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR \
+            -DCMAKE_PREFIX_PATH=$INSTALL_DIR \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DSPDLOG_BUILD_EXAMPLE=OFF \
+            -DSPDLOG_BUILD_TESTS=OFF \
+            -DSPDLOG_FMT_EXTERNAL=ON
+          cmake --build build --config Release
+          cmake --install build
+          cd ..
+
+          # nlohmann/json (header-only)
+          git clone --depth 1 --branch v3.11.3 https://github.com/nlohmann/json.git
+          cd json
+          cmake -B build -G Ninja \
+            -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR \
+            -DJSON_BuildTests=OFF
+          cmake --install build
+          cd ..
+
+      - name: Build phira-mp-server for Windows
+        run: |
+          INSTALL_DIR=${{ github.workspace }}/deps-install
+          DEPSLIB="$INSTALL_DIR/lib"
+          DEPSINC="$INSTALL_DIR/include"
+
+          # Build with explicit paths — no pkg-config for cross-compilation
+          make clean
+          make -j$(nproc) \
+            CXX=x86_64-w64-mingw32-g++ \
+            TARGET=phira-mp-server.exe \
+            CXXFLAGS="-std=c++20 -Wall -Wextra -O2 -DLOCALES_DIR=\\\"./locales\\\" \
+              -I${DEPSINC} -DCURL_STATICLIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_COMPILED_LIB" \
+            LDFLAGS="-static -static-libgcc -static-libstdc++" \
+            LIBS="-L${DEPSLIB} \
+              -lspdlog -lfmt \
+              -lcurl -lssl -lcrypto \
+              -largon2 \
+              -lz -lws2_32 -lcrypt32 -lwldap32 -lbcrypt \
+              -lrpcrt4 -lpthread"
+
+          file phira-mp-server.exe
+          ls -lh phira-mp-server.exe
+
+      - name: Package artifact
+        run: |
+          mkdir -p release/phira-mp-server-windows-amd64
+          cp phira-mp-server.exe release/phira-mp-server-windows-amd64/
+          cp -r locales release/phira-mp-server-windows-amd64/
+          cd release
+          zip -r phira-mp-server-windows-amd64.zip phira-mp-server-windows-amd64/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
           name: phira-mp-server-windows-amd64
-          path: phira-mp-server-windows-amd64.zip
+          path: release/phira-mp-server-windows-amd64.zip
 
   # ═══════════════════════════════════════════════════════════════════
-  # Release
+  # Release — create GitHub Release when a tag is pushed
   # ═══════════════════════════════════════════════════════════════════
   release:
     needs: [build-linux, build-windows]
-    runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - name: Create release
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/phira-mp-server-linux-amd64/phira-mp-server-linux-amd64.tar.gz
-            artifacts/phira-mp-server-linux-arm64/phira-mp-server-linux-arm64.tar.gz
-            artifacts/phira-mp-server-linux-armhf/phira-mp-server-linux-armhf.tar.gz
-            artifacts/phira-mp-server-windows-amd64/phira-mp-server-windows-amd64.zip
+            artifacts/phira-mp-server-linux-amd64/*.tar.gz
+            artifacts/phira-mp-server-linux-arm64/*.tar.gz
+            artifacts/phira-mp-server-linux-armhf/*.tar.gz
+            artifacts/phira-mp-server-windows-amd64/*.zip
           generate_release_notes: true
+          draft: false
+          prerelease: false
