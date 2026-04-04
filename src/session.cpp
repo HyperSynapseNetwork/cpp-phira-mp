@@ -5,8 +5,58 @@
 #include <nlohmann/json.hpp>
 #include <thread>
 #include <cstring>
+#include <filesystem>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 static const std::string PHIRA_HOST = "https://phira.5wyxi.com";
+
+// ── CA certificate path (auto-detected at first use) ─────────────────
+static std::string g_ca_path;
+static bool g_ca_searched = false;
+
+static const std::string& get_ca_path() {
+    if (g_ca_searched) return g_ca_path;
+    g_ca_searched = true;
+
+    namespace fs = std::filesystem;
+
+    // 1) Environment variable
+    if (auto e = std::getenv("CURL_CA_BUNDLE")) {
+        if (fs::exists(e)) { g_ca_path = e; spdlog::info("CA cert from env: {}", g_ca_path); return g_ca_path; }
+    }
+    if (auto e = std::getenv("SSL_CERT_FILE")) {
+        if (fs::exists(e)) { g_ca_path = e; spdlog::info("CA cert from env: {}", g_ca_path); return g_ca_path; }
+    }
+
+    // 2) Next to the executable
+    std::string exe_dir;
+#ifdef _WIN32
+    wchar_t buf[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, buf, MAX_PATH)) {
+        exe_dir = fs::path(buf).parent_path().string();
+    }
+#else
+    try { exe_dir = fs::read_symlink("/proc/self/exe").parent_path().string(); } catch (...) {}
+#endif
+    if (!exe_dir.empty()) {
+        auto p = exe_dir + "/cacert.pem";
+        if (fs::exists(p)) { g_ca_path = p; spdlog::info("CA cert found: {}", g_ca_path); return g_ca_path; }
+    }
+
+    // 3) Current working directory
+    if (fs::exists("cacert.pem")) { g_ca_path = "cacert.pem"; spdlog::info("CA cert found: {}", g_ca_path); return g_ca_path; }
+
+    // 4) Common system locations
+    for (auto loc : {"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+                     "/etc/ssl/cert.pem", "/usr/share/ca-certificates/cacert.pem"}) {
+        if (fs::exists(loc)) { g_ca_path = loc; spdlog::info("CA cert found: {}", g_ca_path); return g_ca_path; }
+    }
+
+    spdlog::warn("No CA cert found; HTTPS verification may fail. Place cacert.pem next to the executable.");
+    return g_ca_path;  // empty — let curl use its default
+}
 
 // ── CURL helper ───────────────────────────────────────────────────────
 static size_t curl_cb(void* p, size_t sz, size_t nm, std::string* o) { o->append((char*)p, sz*nm); return sz*nm; }
@@ -17,6 +67,8 @@ static std::string http_get(const std::string& url, const std::string& auth = ""
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
+    const auto& ca = get_ca_path();
+    if (!ca.empty()) curl_easy_setopt(c, CURLOPT_CAINFO, ca.c_str());
     struct curl_slist* hdrs = nullptr;
     if (!auth.empty()) { hdrs = curl_slist_append(hdrs, ("Authorization: " + auth).c_str()); curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs); }
     CURLcode rc = curl_easy_perform(c); long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
