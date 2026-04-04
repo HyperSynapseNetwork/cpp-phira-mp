@@ -13,214 +13,192 @@ permissions:
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════
-  # Linux amd64 — Alpine Docker (musl libc, native, fast)
-  #
-  # glibc -static triggers SIGFPE (div-by-zero in TLS init on dlopen).
-  # musl libc is designed for static linking and doesn't have this bug.
+  # Linux — Ubuntu, dynamic linking, bundle .so files
   # ═══════════════════════════════════════════════════════════════════
-  build-linux-amd64:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build in Alpine
-        run: |
-          docker run --rm -v "${{ github.workspace }}:/w" -w /w alpine:3.21 sh -c '
-            set -ex
-            apk add --no-cache build-base make pkgconf cmake ninja linux-headers git
-            apk add --no-cache boost-dev nlohmann-json
-            apk add --no-cache openssl-dev openssl-libs-static zlib-dev zlib-static
-
-            PREFIX=/opt/deps; mkdir -p $PREFIX/lib/pkgconfig $PREFIX/include
-
-            # ── curl (minimal: OpenSSL+zlib, no SSH/LDAP/GSSAPI) ──
-            cd /tmp && git clone --depth 1 --branch curl-8_6_0 https://github.com/curl/curl.git && cd curl
-            cmake -B b -G Ninja -DCMAKE_INSTALL_PREFIX=$PREFIX \
-              -DBUILD_SHARED_LIBS=OFF -DBUILD_CURL_EXE=OFF -DBUILD_TESTING=OFF \
-              -DCURL_USE_OPENSSL=ON -DCURL_ZLIB=ON \
-              -DCURL_USE_LIBSSH2=OFF -DCURL_USE_LIBSSH=OFF -DCURL_USE_LIBPSL=OFF \
-              -DUSE_LIBIDN2=OFF -DCURL_DISABLE_LDAP=ON -DCURL_DISABLE_LDAPS=ON \
-              -DUSE_NGHTTP2=OFF -DCURL_USE_GSSAPI=OFF -DENABLE_ARES=OFF
-            cmake --build b -j$(nproc) && cmake --install b
-
-            # ── fmt ──
-            cd /tmp && git clone --depth 1 --branch 10.2.1 https://github.com/fmtlib/fmt.git && cd fmt
-            cmake -B b -G Ninja -DCMAKE_INSTALL_PREFIX=$PREFIX \
-              -DBUILD_SHARED_LIBS=OFF -DFMT_TEST=OFF -DFMT_DOC=OFF
-            cmake --build b -j$(nproc) && cmake --install b
-
-            # ── spdlog ──
-            cd /tmp && git clone --depth 1 --branch v1.14.1 https://github.com/gabime/spdlog.git && cd spdlog
-            cmake -B b -G Ninja -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_PREFIX_PATH=$PREFIX \
-              -DBUILD_SHARED_LIBS=OFF -DSPDLOG_BUILD_EXAMPLE=OFF -DSPDLOG_BUILD_TESTS=OFF \
-              -DSPDLOG_FMT_EXTERNAL=ON
-            cmake --build b -j$(nproc) && cmake --install b
-
-            # ── argon2 ──
-            cd /tmp && git clone --depth 1 https://github.com/P-H-C/phc-winner-argon2.git && cd phc-winner-argon2
-            cc -std=c89 -O2 -c src/argon2.c -Iinclude -o a.o
-            cc -std=c89 -O2 -c src/core.c -Iinclude -o b.o
-            cc -std=c89 -O2 -c src/blake2/blake2b.c -Iinclude -o c.o
-            cc -std=c89 -O2 -c src/thread.c -Iinclude -o d.o
-            cc -std=c89 -O2 -c src/encoding.c -Iinclude -o e.o
-            cc -std=c89 -O2 -c src/ref.c -Iinclude -o f.o
-            ar rcs $PREFIX/lib/libargon2.a a.o b.o c.o d.o e.o f.o
-            cp include/argon2.h $PREFIX/include/
-
-            # ── libuuid ──
-            apk add --no-cache util-linux-dev 2>/dev/null || true
-            if [ ! -f /usr/lib/libuuid.a ]; then
-              cd /tmp && apk add --no-cache autoconf automake libtool bison
-              wget -q https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.40/util-linux-2.40.2.tar.xz
-              tar xf util-linux-2.40.2.tar.xz && cd util-linux-2.40.2
-              ./configure --disable-all-programs --enable-libuuid --enable-static --disable-shared --disable-nls --prefix=/usr
-              make -j$(nproc) && make install
-            fi
-
-            # ── Build ──
-            cd /w && make clean
-            make -j$(nproc) \
-              STATIC=1 LOCALES_DIR=./locales TARGET=phira-mp-server \
-              CXXFLAGS="-std=c++20 -Wall -Wextra -O2 -pthread -DLOCALES_DIR=./locales -DSPDLOG_FMT_EXTERNAL -DSPDLOG_COMPILED_LIB -I$PREFIX/include" \
-              LDFLAGS="-static -L$PREFIX/lib" \
-              LIBS="-lspdlog -lfmt -lcurl -lssl -lcrypto -largon2 -luuid -lz -lpthread"
-            file phira-mp-server && ls -lh phira-mp-server
-          '
-      - name: Package
-        run: |
-          mkdir -p release/phira-mp-server-linux-amd64
-          cp phira-mp-server release/phira-mp-server-linux-amd64/
-          cp -r locales release/phira-mp-server-linux-amd64/
-          cd release && tar czf phira-mp-server-linux-amd64.tar.gz phira-mp-server-linux-amd64/
-      - uses: actions/upload-artifact@v4
-        with:
-          name: phira-mp-server-linux-amd64
-          path: release/phira-mp-server-linux-amd64.tar.gz
-
-  # ═══════════════════════════════════════════════════════════════════
-  # Linux arm64 & armhf — musl-cross toolchain (no QEMU, fast)
-  #
-  # Uses prebuilt musl cross-compilers from musl.cc.
-  # All deps built from source. Produces fully static musl binaries.
-  # ═══════════════════════════════════════════════════════════════════
-  build-linux-arm:
-    runs-on: ubuntu-latest
+  build-linux:
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         include:
+          - arch: amd64
+            artifact: phira-mp-server-linux-amd64
+            deb_arch: amd64
+            triple: x86_64-linux-gnu
+            cxx: g++
+            cc: gcc
+            cross_pkg: ""
+            is_cross: false
           - arch: arm64
             artifact: phira-mp-server-linux-arm64
-            musl_arch: aarch64-linux-musl
-            openssl_target: linux-aarch64
+            deb_arch: arm64
+            triple: aarch64-linux-gnu
+            cxx: aarch64-linux-gnu-g++
+            cc: aarch64-linux-gnu-gcc
+            cross_pkg: g++-aarch64-linux-gnu
+            is_cross: true
           - arch: armhf
             artifact: phira-mp-server-linux-armhf
-            musl_arch: arm-linux-musleabihf
-            openssl_target: linux-armv4
+            deb_arch: armhf
+            triple: arm-linux-gnueabihf
+            cxx: arm-linux-gnueabihf-g++
+            cc: arm-linux-gnueabihf-gcc
+            cross_pkg: g++-arm-linux-gnueabihf
+            is_cross: true
 
     env:
-      CROSS: ${{ matrix.musl_arch }}
-      PREFIX: /home/runner/sysroot
+      SYSROOT: /home/runner/sysroot
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
-
-      - name: Download musl-cross toolchain
+      - name: Set up multiarch apt (cross-compile only)
+        if: matrix.is_cross
         run: |
-          cd /opt
-          wget -q "https://musl.cc/${{ matrix.musl_arch }}-cross.tgz"
-          tar xf ${{ matrix.musl_arch }}-cross.tgz
-          echo "/opt/${{ matrix.musl_arch }}-cross/bin" >> $GITHUB_PATH
+          sudo dpkg --add-architecture ${{ matrix.deb_arch }}
+          sudo sed -i '/^URIs:/i Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+          CODENAME=$(lsb_release -cs)
+          printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports\nSuites: %s %s-updates %s-security\nComponents: main universe\nArchitectures: %s\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
+            "$CODENAME" "$CODENAME" "$CODENAME" "${{ matrix.deb_arch }}" \
+            | sudo tee /etc/apt/sources.list.d/${{ matrix.deb_arch }}-cross.sources
+          sudo apt-get update
+
+      - name: Install tools and cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential make pkg-config cmake ninja-build patchelf
+          if [ -n "${{ matrix.cross_pkg }}" ]; then
+            sudo apt-get install -y ${{ matrix.cross_pkg }}
+          fi
+
+      - name: Install library dependencies from apt
+        run: |
+          S=""
+          if [ "${{ matrix.is_cross }}" = "true" ]; then S=":${{ matrix.deb_arch }}"; fi
+
+          sudo apt-get install -y libboost-dev nlohmann-json3-dev
+
+          sudo apt-get install -y \
+            libssl-dev${S} \
+            libcurl4-openssl-dev${S} \
+            zlib1g-dev${S} \
+            uuid-dev${S}
 
       - name: Prepare sysroot
-        run: mkdir -p $PREFIX/lib/pkgconfig $PREFIX/include
+        run: mkdir -p $SYSROOT/lib/pkgconfig $SYSROOT/include
 
-      - name: Build zlib
-        run: |
-          cd /tmp && git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git && cd zlib
-          CHOST=${CROSS} CC=${CROSS}-gcc AR=${CROSS}-ar RANLIB=${CROSS}-ranlib \
-            ./configure --static --prefix=$PREFIX
-          make -j$(nproc) && make install
-
-      - name: Build OpenSSL
-        run: |
-          cd /tmp && git clone --depth 1 --branch openssl-3.2.1 https://github.com/openssl/openssl.git && cd openssl
-          ./Configure ${{ matrix.openssl_target }} no-shared no-tests no-dso no-engine \
-            --cross-compile-prefix=${CROSS}- --prefix=$PREFIX
-          make -j$(nproc) && make install_sw
-
-      - name: Build curl (minimal)
-        run: |
-          cd /tmp && git clone --depth 1 --branch curl-8_6_0 https://github.com/curl/curl.git && cd curl
-          cmake -B b -G Ninja \
-            -DCMAKE_SYSTEM_NAME=Linux \
-            -DCMAKE_C_COMPILER=${CROSS}-gcc \
-            -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_PREFIX_PATH=$PREFIX \
-            -DBUILD_SHARED_LIBS=OFF -DBUILD_CURL_EXE=OFF -DBUILD_TESTING=OFF \
-            -DCURL_USE_OPENSSL=ON -DOPENSSL_ROOT_DIR=$PREFIX \
-            -DCURL_ZLIB=ON -DZLIB_LIBRARY=$PREFIX/lib/libz.a -DZLIB_INCLUDE_DIR=$PREFIX/include \
-            -DCURL_USE_LIBSSH2=OFF -DCURL_USE_LIBSSH=OFF -DCURL_USE_LIBPSL=OFF \
-            -DUSE_LIBIDN2=OFF -DCURL_DISABLE_LDAP=ON -DCURL_DISABLE_LDAPS=ON \
-            -DUSE_NGHTTP2=OFF -DCURL_USE_GSSAPI=OFF -DENABLE_ARES=OFF
-          cmake --build b -j$(nproc) && cmake --install b
-
-      - name: Build fmt
+      - name: Build fmt from source
         run: |
           cd /tmp && git clone --depth 1 --branch 10.2.1 https://github.com/fmtlib/fmt.git && cd fmt
-          cmake -B b -G Ninja \
-            -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++ \
-            -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=OFF -DFMT_TEST=OFF -DFMT_DOC=OFF
-          cmake --build b -j$(nproc) && cmake --install b
+          cmake -B build -G Ninja \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DCMAKE_INSTALL_PREFIX=$SYSROOT \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF -DFMT_TEST=OFF -DFMT_DOC=OFF
+          cmake --build build -j$(nproc) && cmake --install build
 
-      - name: Build spdlog
+      - name: Build spdlog from source
         run: |
           cd /tmp && git clone --depth 1 --branch v1.14.1 https://github.com/gabime/spdlog.git && cd spdlog
-          cmake -B b -G Ninja \
-            -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++ \
-            -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_PREFIX_PATH=$PREFIX \
-            -DBUILD_SHARED_LIBS=OFF -DSPDLOG_BUILD_EXAMPLE=OFF -DSPDLOG_BUILD_TESTS=OFF -DSPDLOG_FMT_EXTERNAL=ON
-          cmake --build b -j$(nproc) && cmake --install b
+          cmake -B build -G Ninja \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DCMAKE_INSTALL_PREFIX=$SYSROOT \
+            -DCMAKE_PREFIX_PATH=$SYSROOT \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DSPDLOG_BUILD_EXAMPLE=OFF -DSPDLOG_BUILD_TESTS=OFF \
+            -DSPDLOG_FMT_EXTERNAL=ON
+          cmake --build build -j$(nproc) && cmake --install build
 
-      - name: Build argon2
+      - name: Build argon2 from source
         run: |
           cd /tmp && git clone --depth 1 https://github.com/P-H-C/phc-winner-argon2.git && cd phc-winner-argon2
-          ${CROSS}-gcc -std=c89 -O2 -c src/argon2.c -Iinclude -o a.o
-          ${CROSS}-gcc -std=c89 -O2 -c src/core.c -Iinclude -o b.o
-          ${CROSS}-gcc -std=c89 -O2 -c src/blake2/blake2b.c -Iinclude -o c.o
-          ${CROSS}-gcc -std=c89 -O2 -c src/thread.c -Iinclude -o d.o
-          ${CROSS}-gcc -std=c89 -O2 -c src/encoding.c -Iinclude -o e.o
-          ${CROSS}-gcc -std=c89 -O2 -c src/ref.c -Iinclude -o f.o
-          ${CROSS}-ar rcs $PREFIX/lib/libargon2.a a.o b.o c.o d.o e.o f.o
-          cp include/argon2.h $PREFIX/include/
-
-      - name: Build libuuid
-        run: |
-          sudo apt-get install -y autoconf automake libtool bison
-          cd /tmp && wget -q https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.40/util-linux-2.40.2.tar.xz
-          tar xf util-linux-2.40.2.tar.xz && cd util-linux-2.40.2
-          ./configure --host=${CROSS} --disable-all-programs --enable-libuuid \
-            --enable-static --disable-shared --disable-nls --prefix=$PREFIX
-          make -j$(nproc) && make install
+          ${{ matrix.cc }} -std=c89 -O2 -fPIC -c src/argon2.c        -Iinclude -o argon2.o
+          ${{ matrix.cc }} -std=c89 -O2 -fPIC -c src/core.c          -Iinclude -o core.o
+          ${{ matrix.cc }} -std=c89 -O2 -fPIC -c src/blake2/blake2b.c -Iinclude -o blake2b.o
+          ${{ matrix.cc }} -std=c89 -O2 -fPIC -c src/thread.c        -Iinclude -o thread.o
+          ${{ matrix.cc }} -std=c89 -O2 -fPIC -c src/encoding.c      -Iinclude -o encoding.o
+          ${{ matrix.cc }} -std=c89 -O2 -fPIC -c src/ref.c           -Iinclude -o ref.o
+          ar rcs $SYSROOT/lib/libargon2.a argon2.o core.o blake2b.o thread.o encoding.o ref.o
+          cp include/argon2.h $SYSROOT/include/
 
       - name: Build phira-mp-server
         run: |
+          LIBDIR="/usr/lib/${{ matrix.triple }}"
+          export PKG_CONFIG_PATH="${SYSROOT}/lib/pkgconfig:${SYSROOT}/lib64/pkgconfig:${LIBDIR}/pkgconfig:/usr/share/pkgconfig"
+          export PKG_CONFIG_LIBDIR="${PKG_CONFIG_PATH}"
+
           make -j$(nproc) \
-            CXX="${CROSS}-g++" \
+            CXX="${{ matrix.cxx }}" \
             TARGET=phira-mp-server \
             CXXFLAGS="-std=c++20 -Wall -Wextra -O2 -pthread \
-              -DLOCALES_DIR=./locales -DSPDLOG_FMT_EXTERNAL -DSPDLOG_COMPILED_LIB \
-              -I${PREFIX}/include" \
-            LDFLAGS="-static -L${PREFIX}/lib" \
-            LIBS="-lspdlog -lfmt -lcurl -lssl -lcrypto -largon2 -luuid -lz -lpthread"
-          file phira-mp-server && ls -lh phira-mp-server
+              -DLOCALES_DIR=./locales \
+              -DSPDLOG_FMT_EXTERNAL -DSPDLOG_COMPILED_LIB \
+              -I${SYSROOT}/include \
+              $(pkg-config --cflags openssl libcurl nlohmann_json 2>/dev/null || true)" \
+            LDFLAGS="-L${SYSROOT}/lib -L${LIBDIR} \
+              -Wl,-rpath,'\$\$ORIGIN/lib'" \
+            LIBS="-lspdlog -lfmt \
+              -lcurl -lssl -lcrypto \
+              -largon2 -luuid -lz \
+              -lpthread -ldl"
 
-      - name: Package
+          file phira-mp-server
+          ls -lh phira-mp-server
+
+      - name: Collect .so files and package
         run: |
-          mkdir -p release/${{ matrix.artifact }}
-          cp phira-mp-server release/${{ matrix.artifact }}/
-          cp -r locales release/${{ matrix.artifact }}/
+          TRIPLE="${{ matrix.triple }}"
+          LIBDIR="/usr/lib/${TRIPLE}"
+          DEST="release/${{ matrix.artifact }}"
+          mkdir -p "$DEST/lib"
+
+          cp phira-mp-server "$DEST/"
+          cp -r locales "$DEST/"
+
+          # Collect all non-system .so dependencies
+          # For native amd64, use ldd directly; for cross, use objdump to find NEEDED
+          if [ "${{ matrix.is_cross }}" = "true" ]; then
+            # Cross: parse ELF NEEDED entries
+            NEEDED=$(${{ matrix.triple }}-objdump -p phira-mp-server | grep NEEDED | awk '{print $2}')
+          else
+            NEEDED=$(ldd phira-mp-server | awk '{print $1}')
+          fi
+
+          echo "=== Collecting .so files ==="
+          for soname in $NEEDED; do
+            # Skip system libs (libc, libm, libdl, libpthread, ld-linux, libgcc, libstdc++)
+            case "$soname" in
+              linux-*|ld-*|libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libgcc_s*|libstdc++*) continue ;;
+            esac
+            # Search in sysroot and system lib dirs
+            for dir in "$SYSROOT/lib" "$LIBDIR" "/usr/lib" "/lib/${TRIPLE}"; do
+              found=$(find "$dir" -name "$soname" -o -name "${soname}*" 2>/dev/null | head -1)
+              if [ -n "$found" ] && [ -f "$found" ]; then
+                echo "  COPY: $found"
+                cp -L "$found" "$DEST/lib/"
+                break
+              fi
+            done
+          done
+
+          # Create a wrapper script that sets LD_LIBRARY_PATH
+          printf '#!/bin/sh\nDIR="$(cd "$(dirname "$0")" && pwd)"\nexport LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"\nexec "$DIR/phira-mp-server" "$@"\n' > "$DEST/start.sh"
+          chmod +x "$DEST/start.sh"
+
+          # Also set RPATH on the binary to look in ./lib
+          if command -v patchelf >/dev/null 2>&1 && [ "${{ matrix.is_cross }}" = "false" ]; then
+            patchelf --set-rpath '$ORIGIN/lib' "$DEST/phira-mp-server" || true
+          fi
+
+          echo ""
+          echo "=== Package contents ==="
+          find "$DEST" -type f | sort
+
+      - name: Create tarball
+        run: |
           cd release && tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}/
 
       - uses: actions/upload-artifact@v4
@@ -304,7 +282,7 @@ jobs:
 
   # ═══════════════════════════════════════════════════════════════════
   release:
-    needs: [build-linux-amd64, build-linux-arm, build-windows]
+    needs: [build-linux, build-windows]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
