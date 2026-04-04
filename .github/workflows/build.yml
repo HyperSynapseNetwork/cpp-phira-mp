@@ -158,6 +158,9 @@ jobs:
           cp phira-mp-server "$DEST/"
           cp -r locales "$DEST/"
 
+          # Download CA certificate bundle
+          curl -sL -o "$DEST/cacert.pem" https://curl.se/ca/cacert.pem
+
           # Collect all non-system .so dependencies
           # For native amd64, use ldd directly; for cross, use objdump to find NEEDED
           if [ "${{ matrix.is_cross }}" = "true" ]; then
@@ -268,6 +271,8 @@ jobs:
             [ -n "$d" ] && [ -f "/ucrt64/bin/$d" ] && echo "  COPY: $d" && cp "/ucrt64/bin/$d" "$DEST/"
           done
           cp -r locales "$DEST/"
+          # Download CA certificate bundle
+          curl -sL -o "$DEST/cacert.pem" https://curl.se/ca/cacert.pem
           echo "=== Package contents ==="
           ls -la "$DEST/"
 
