@@ -13,59 +13,27 @@ permissions:
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════
-  # Linux builds — Alpine Docker for fully-static musl binaries
-  #
-  # Alpine does NOT ship -static packages for spdlog / fmt / argon2,
-  # so we build them from source inside the container.
+  # Linux amd64 — Alpine Docker, native, fast
   # ═══════════════════════════════════════════════════════════════════
-  build-linux:
+  build-linux-amd64:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-            artifact: phira-mp-server-linux-amd64
-          - arch: arm64
-            platform: linux/arm64
-            artifact: phira-mp-server-linux-arm64
-          - arch: armhf
-            platform: linux/arm/v7
-            artifact: phira-mp-server-linux-armhf
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU (for cross-architecture builds)
-        if: matrix.arch != 'amd64'
-        uses: docker/setup-qemu-action@v3
+      - uses: actions/checkout@v4
 
       - name: Build static binary in Alpine container
         run: |
-          docker run --rm --platform ${{ matrix.platform }} \
+          docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             alpine:3.21 \
             sh -c '
               set -ex
 
-              # ══════════════════════════════════════════════════════
-              # 1. Build tools
-              # ══════════════════════════════════════════════════════
               apk add --no-cache \
-                build-base make pkgconf cmake linux-headers \
-                wget tar xz
+                build-base make pkgconf cmake linux-headers wget tar xz
 
-              # ══════════════════════════════════════════════════════
-              # 2. Header-only libraries (from Alpine packages)
-              # ══════════════════════════════════════════════════════
               apk add --no-cache boost-dev nlohmann-json
 
-              # ══════════════════════════════════════════════════════
-              # 3. Libraries that DO have -static packages in Alpine
-              # ══════════════════════════════════════════════════════
               apk add --no-cache \
                 openssl-dev   openssl-libs-static \
                 curl-dev      curl-static \
@@ -73,7 +41,6 @@ jobs:
                 brotli-dev    brotli-static \
                 nghttp2-dev   nghttp2-static
 
-              # Optional transitive deps of libcurl (try each individually)
               for pkg in \
                 zstd-dev zstd-static \
                 libpsl-dev libpsl-static \
@@ -84,51 +51,36 @@ jobs:
                 apk add --no-cache "$pkg" 2>/dev/null || echo "SKIP: $pkg"
               done
 
-              # ══════════════════════════════════════════════════════
-              # 4. Build fmt from source (Alpine has NO fmt-static)
-              # ══════════════════════════════════════════════════════
+              # ── fmt (no Alpine static package) ──
               cd /tmp
               wget -q https://github.com/fmtlib/fmt/archive/refs/tags/10.2.1.tar.gz -O fmt.tar.gz
               tar xf fmt.tar.gz && cd fmt-10.2.1
-              cmake -B build \
-                -DCMAKE_INSTALL_PREFIX=/usr \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DBUILD_SHARED_LIBS=OFF \
-                -DFMT_TEST=OFF \
-                -DFMT_DOC=OFF
+              cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_SHARED_LIBS=OFF -DFMT_TEST=OFF -DFMT_DOC=OFF
               cmake --build build -j$(nproc)
               cmake --install build
 
-              # ══════════════════════════════════════════════════════
-              # 5. Build spdlog from source (Alpine has NO spdlog-static)
-              # ══════════════════════════════════════════════════════
+              # ── spdlog (no Alpine static package) ──
               cd /tmp
               wget -q https://github.com/gabime/spdlog/archive/refs/tags/v1.14.1.tar.gz -O spdlog.tar.gz
               tar xf spdlog.tar.gz && cd spdlog-1.14.1
-              cmake -B build \
-                -DCMAKE_INSTALL_PREFIX=/usr \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DBUILD_SHARED_LIBS=OFF \
-                -DSPDLOG_BUILD_EXAMPLE=OFF \
-                -DSPDLOG_BUILD_TESTS=OFF \
+              cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_SHARED_LIBS=OFF -DSPDLOG_BUILD_EXAMPLE=OFF -DSPDLOG_BUILD_TESTS=OFF \
                 -DSPDLOG_FMT_EXTERNAL=ON
               cmake --build build -j$(nproc)
               cmake --install build
 
-              # ══════════════════════════════════════════════════════
-              # 6. Build libargon2 from source (no -static package)
-              # ══════════════════════════════════════════════════════
+              # ── argon2 ──
               cd /tmp
               wget -q https://github.com/P-H-C/phc-winner-argon2/archive/refs/tags/20190702.tar.gz -O argon2.tar.gz
               tar xf argon2.tar.gz && cd phc-winner-argon2-20190702
-              cc -std=c89 -O2 -c src/argon2.c    -Iinclude -o src/argon2.o
-              cc -std=c89 -O2 -c src/core.c      -Iinclude -o src/core.o
+              cc -std=c89 -O2 -c src/argon2.c -Iinclude -o src/argon2.o
+              cc -std=c89 -O2 -c src/core.c -Iinclude -o src/core.o
               cc -std=c89 -O2 -c src/blake2/blake2b.c -Iinclude -o src/blake2/blake2b.o
-              cc -std=c89 -O2 -c src/thread.c    -Iinclude -o src/thread.o
-              cc -std=c89 -O2 -c src/encoding.c  -Iinclude -o src/encoding.o
-              cc -std=c89 -O2 -c src/ref.c       -Iinclude -o src/ref.o
-              ar rcs libargon2.a src/argon2.o src/core.o src/blake2/blake2b.o \
-                src/thread.o src/encoding.o src/ref.o
+              cc -std=c89 -O2 -c src/thread.c -Iinclude -o src/thread.o
+              cc -std=c89 -O2 -c src/encoding.c -Iinclude -o src/encoding.o
+              cc -std=c89 -O2 -c src/ref.c -Iinclude -o src/ref.o
+              ar rcs libargon2.a src/argon2.o src/core.o src/blake2/blake2b.o src/thread.o src/encoding.o src/ref.o
               cp libargon2.a /usr/lib/
               cp include/argon2.h /usr/include/
               cat > /usr/lib/pkgconfig/libargon2.pc << PC
@@ -136,68 +88,210 @@ jobs:
           libdir=\${prefix}/lib
           includedir=\${prefix}/include
           Name: libargon2
-          Description: Argon2 password hashing library
+          Description: Argon2
           Version: 20190702
           Libs: -L\${libdir} -largon2
           Cflags: -I\${includedir}
           PC
 
-              # ══════════════════════════════════════════════════════
-              # 7. Build libuuid static if missing
-              # ══════════════════════════════════════════════════════
+              # ── libuuid static ──
               apk add --no-cache util-linux-dev 2>/dev/null || true
               if [ ! -f /usr/lib/libuuid.a ]; then
-                echo ">> Building libuuid.a from source"
                 cd /tmp
                 apk add --no-cache autoconf automake libtool bison
                 wget -q https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.40/util-linux-2.40.2.tar.xz -O util-linux.tar.xz
                 tar xf util-linux.tar.xz && cd util-linux-2.40.2
                 ./configure --disable-all-programs --enable-libuuid \
                   --enable-static --disable-shared --disable-nls --prefix=/usr
-                make -j$(nproc)
-                make install
+                make -j$(nproc) && make install
               fi
 
-              # ══════════════════════════════════════════════════════
-              # 8. Diagnostics
-              # ══════════════════════════════════════════════════════
-              echo "===== Verifying static libraries ====="
-              for lib in spdlog fmt argon2 uuid curl ssl crypto z zstd brotlidec brotlicommon nghttp2; do
-                [ -f /usr/lib/lib${lib}.a ] && echo "OK   /usr/lib/lib${lib}.a" || echo "MISS /usr/lib/lib${lib}.a"
-              done
-
-              echo "===== pkg-config --static --libs libcurl ====="
-              pkg-config --static --libs libcurl 2>&1 || true
-              echo "===== pkg-config --static --libs spdlog ====="
-              pkg-config --static --libs spdlog 2>&1 || true
-
-              # ══════════════════════════════════════════════════════
-              # 9. Build the project
-              # ══════════════════════════════════════════════════════
+              # ── Build ──
               cd /workspace
               make clean
-              make -j$(nproc) \
-                STATIC=1 \
-                LOCALES_DIR=\"./locales\" \
-                TARGET=phira-mp-server
-
-              # ══════════════════════════════════════════════════════
-              # 10. Verify
-              # ══════════════════════════════════════════════════════
+              make -j$(nproc) STATIC=1 LOCALES_DIR=\"./locales\" TARGET=phira-mp-server
               file phira-mp-server
-              ls -lh phira-mp-server
             '
 
-      - name: Package artifact
+      - name: Package
+        run: |
+          mkdir -p release/phira-mp-server-linux-amd64
+          cp phira-mp-server release/phira-mp-server-linux-amd64/
+          cp -r locales release/phira-mp-server-linux-amd64/
+          cd release && tar czf phira-mp-server-linux-amd64.tar.gz phira-mp-server-linux-amd64/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phira-mp-server-linux-amd64
+          path: release/phira-mp-server-linux-amd64.tar.gz
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Linux arm64 & armhf — cross-compile on ubuntu (NO QEMU)
+  #
+  # All dependencies are built from source with the cross-compiler.
+  # This is much faster than QEMU-emulated Alpine Docker.
+  # ═══════════════════════════════════════════════════════════════════
+  build-linux-arm:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            artifact: phira-mp-server-linux-arm64
+            cross: aarch64-linux-gnu
+            cross_pkg: g++-aarch64-linux-gnu
+            openssl_target: linux-aarch64
+            cmake_system_processor: aarch64
+            configure_host: aarch64-linux-gnu
+          - arch: armhf
+            artifact: phira-mp-server-linux-armhf
+            cross: arm-linux-gnueabihf
+            cross_pkg: g++-arm-linux-gnueabihf
+            openssl_target: linux-armv4
+            cmake_system_processor: arm
+            configure_host: arm-linux-gnueabihf
+
+    env:
+      CROSS: ${{ matrix.cross }}
+      PREFIX: ${{ github.workspace }}/sysroot
+      NJOBS: 4
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-compiler and header-only deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cross_pkg }} cmake ninja-build pkg-config wget
+          # Header-only: architecture-independent, install normally
+          sudo apt-get install -y libboost-dev nlohmann-json3-dev
+
+      - name: Prepare sysroot
+        run: mkdir -p $PREFIX/lib $PREFIX/include $PREFIX/lib/pkgconfig
+
+      - name: Build zlib
+        run: |
+          cd /tmp && wget -q https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz && tar xf zlib-1.3.1.tar.gz && cd zlib-1.3.1
+          CHOST=${{ matrix.cross }} CC=${{ matrix.cross }}-gcc AR=${{ matrix.cross }}-ar RANLIB=${{ matrix.cross }}-ranlib \
+            ./configure --static --prefix=$PREFIX
+          make -j$NJOBS && make install
+
+      - name: Build OpenSSL
+        run: |
+          cd /tmp && wget -q https://github.com/openssl/openssl/releases/download/openssl-3.2.1/openssl-3.2.1.tar.gz && tar xf openssl-3.2.1.tar.gz && cd openssl-3.2.1
+          ./Configure ${{ matrix.openssl_target }} no-shared no-tests \
+            --cross-compile-prefix=${{ matrix.cross }}- \
+            --prefix=$PREFIX
+          make -j$NJOBS && make install_sw
+
+      - name: Build curl (minimal)
+        run: |
+          cd /tmp && wget -q https://github.com/curl/curl/releases/download/curl-8_6_0/curl-8.6.0.tar.xz && tar xf curl-8.6.0.tar.xz && cd curl-8.6.0
+          cmake -B build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.cmake_system_processor }} \
+            -DCMAKE_C_COMPILER=${{ matrix.cross }}-gcc \
+            -DCMAKE_INSTALL_PREFIX=$PREFIX \
+            -DCMAKE_PREFIX_PATH=$PREFIX \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_CURL_EXE=OFF \
+            -DBUILD_TESTING=OFF \
+            -DCURL_USE_OPENSSL=ON \
+            -DOPENSSL_ROOT_DIR=$PREFIX \
+            -DCURL_ZLIB=ON \
+            -DZLIB_LIBRARY=$PREFIX/lib/libz.a \
+            -DZLIB_INCLUDE_DIR=$PREFIX/include \
+            -DCURL_USE_LIBSSH2=OFF \
+            -DCURL_USE_LIBPSL=OFF \
+            -DUSE_LIBIDN2=OFF \
+            -DCURL_DISABLE_LDAP=ON \
+            -DHTTP_ONLY=OFF
+          cmake --build build -j$NJOBS && cmake --install build
+
+      - name: Build fmt
+        run: |
+          cd /tmp && wget -q https://github.com/fmtlib/fmt/archive/refs/tags/10.2.1.tar.gz -O fmt.tar.gz && tar xf fmt.tar.gz && cd fmt-10.2.1
+          cmake -B build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.cmake_system_processor }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cross }}-g++ \
+            -DCMAKE_INSTALL_PREFIX=$PREFIX \
+            -DBUILD_SHARED_LIBS=OFF -DFMT_TEST=OFF -DFMT_DOC=OFF
+          cmake --build build -j$NJOBS && cmake --install build
+
+      - name: Build spdlog
+        run: |
+          cd /tmp && wget -q https://github.com/gabime/spdlog/archive/refs/tags/v1.14.1.tar.gz -O spdlog.tar.gz && tar xf spdlog.tar.gz && cd spdlog-1.14.1
+          cmake -B build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.cmake_system_processor }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cross }}-g++ \
+            -DCMAKE_INSTALL_PREFIX=$PREFIX \
+            -DCMAKE_PREFIX_PATH=$PREFIX \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DSPDLOG_BUILD_EXAMPLE=OFF -DSPDLOG_BUILD_TESTS=OFF \
+            -DSPDLOG_FMT_EXTERNAL=ON
+          cmake --build build -j$NJOBS && cmake --install build
+
+      - name: Build argon2
+        run: |
+          cd /tmp && wget -q https://github.com/P-H-C/phc-winner-argon2/archive/refs/tags/20190702.tar.gz -O argon2.tar.gz && tar xf argon2.tar.gz && cd phc-winner-argon2-20190702
+          ${{ matrix.cross }}-gcc -std=c89 -O2 -c src/argon2.c -Iinclude -o src/argon2.o
+          ${{ matrix.cross }}-gcc -std=c89 -O2 -c src/core.c -Iinclude -o src/core.o
+          ${{ matrix.cross }}-gcc -std=c89 -O2 -c src/blake2/blake2b.c -Iinclude -o src/blake2/blake2b.o
+          ${{ matrix.cross }}-gcc -std=c89 -O2 -c src/thread.c -Iinclude -o src/thread.o
+          ${{ matrix.cross }}-gcc -std=c89 -O2 -c src/encoding.c -Iinclude -o src/encoding.o
+          ${{ matrix.cross }}-gcc -std=c89 -O2 -c src/ref.c -Iinclude -o src/ref.o
+          ${{ matrix.cross }}-ar rcs $PREFIX/lib/libargon2.a src/argon2.o src/core.o src/blake2/blake2b.o src/thread.o src/encoding.o src/ref.o
+          cp include/argon2.h $PREFIX/include/
+          cat > $PREFIX/lib/pkgconfig/libargon2.pc << PC
+          prefix=$PREFIX
+          libdir=\${prefix}/lib
+          includedir=\${prefix}/include
+          Name: libargon2
+          Description: Argon2
+          Version: 20190702
+          Libs: -L\${libdir} -largon2
+          Cflags: -I\${includedir}
+          PC
+
+      - name: Build libuuid
+        run: |
+          cd /tmp && wget -q https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.40/util-linux-2.40.2.tar.xz && tar xf util-linux-2.40.2.tar.xz && cd util-linux-2.40.2
+          ./configure --host=${{ matrix.configure_host }} \
+            --disable-all-programs --enable-libuuid \
+            --enable-static --disable-shared --disable-nls \
+            --prefix=$PREFIX
+          make -j$NJOBS && make install
+
+      - name: Build phira-mp-server
+        run: |
+          # Point pkg-config at cross-compiled sysroot
+          export PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig:$PREFIX/lib64/pkgconfig
+          export PKG_CONFIG_LIBDIR=$PREFIX/lib/pkgconfig
+
+          echo "=== pkg-config --static --libs libcurl ==="
+          pkg-config --static --libs libcurl || true
+          echo "=== pkg-config --static --libs spdlog ==="
+          pkg-config --static --libs spdlog || true
+
+          make -j$NJOBS \
+            CXX=${{ matrix.cross }}-g++ \
+            STATIC=1 \
+            LOCALES_DIR=\"./locales\" \
+            TARGET=phira-mp-server
+
+          file phira-mp-server
+
+      - name: Package
         run: |
           mkdir -p release/${{ matrix.artifact }}
           cp phira-mp-server release/${{ matrix.artifact }}/
           cp -r locales release/${{ matrix.artifact }}/
-          cd release
-          tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}/
+          cd release && tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}/
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: release/${{ matrix.artifact }}.tar.gz
@@ -212,8 +306,7 @@ jobs:
         shell: msys2 {0}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
@@ -230,16 +323,13 @@ jobs:
             mingw-w64-ucrt-x86_64-nlohmann-json
             mingw-w64-ucrt-x86_64-curl
             mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-ntldd
 
       - name: Install or build argon2
         run: |
-          # Try the MSYS2 package first
-          pacman -S --noconfirm mingw-w64-ucrt-x86_64-argon2 2>/dev/null && {
-            echo "argon2 installed from MSYS2 repo"
-            exit 0
-          }
+          pacman -S --noconfirm mingw-w64-ucrt-x86_64-argon2 2>/dev/null && exit 0
 
-          echo ">> Building argon2 from source for MinGW"
+          echo ">> Building argon2 from source"
           cd /tmp
           curl -sL https://github.com/P-H-C/phc-winner-argon2/archive/refs/tags/20190702.tar.gz | tar xz
           cd phc-winner-argon2-20190702
@@ -249,19 +339,16 @@ jobs:
           gcc -std=c89 -O2 -c src/thread.c      -Iinclude -o src/thread.o
           gcc -std=c89 -O2 -c src/encoding.c    -Iinclude -o src/encoding.o
           gcc -std=c89 -O2 -c src/ref.c         -Iinclude -o src/ref.o
-          ar rcs libargon2.a src/argon2.o src/core.o src/blake2/blake2b.o \
-            src/thread.o src/encoding.o src/ref.o
+          ar rcs libargon2.a src/argon2.o src/core.o src/blake2/blake2b.o src/thread.o src/encoding.o src/ref.o
           cp libargon2.a /ucrt64/lib/
           cp include/argon2.h /ucrt64/include/
-
-          # Create pkg-config file so Makefile can find it
           mkdir -p /ucrt64/lib/pkgconfig
           cat > /ucrt64/lib/pkgconfig/libargon2.pc << 'PC'
           prefix=/ucrt64
           libdir=${prefix}/lib
           includedir=${prefix}/include
           Name: libargon2
-          Description: Argon2 password hashing library
+          Description: Argon2
           Version: 20190702
           Libs: -L${libdir} -largon2
           Cflags: -I${includedir}
@@ -269,71 +356,65 @@ jobs:
 
       - name: Build
         run: |
-          echo "===== pkg-config diagnostics ====="
-          pkg-config --libs spdlog libargon2 nlohmann_json openssl libcurl 2>&1 || true
-
           make -j$(nproc) \
             TARGET=phira-mp-server.exe \
             LOCALES_DIR=\"./locales\"
-
           file phira-mp-server.exe
-          ls -lh phira-mp-server.exe
 
       - name: Collect DLLs and package
         run: |
-          mkdir -p release/phira-mp-server-windows-amd64
+          DEST=release/phira-mp-server-windows-amd64
+          mkdir -p "$DEST"
 
-          cp phira-mp-server.exe release/phira-mp-server-windows-amd64/
+          cp phira-mp-server.exe "$DEST/"
 
-          # ── Recursively collect every UCRT64 DLL the exe needs ──
-          collect_dlls() {
-            local binary="$1"
-            ldd "$binary" 2>/dev/null | grep -i '/ucrt64/' | awk '{print $3}' | while read -r dll; do
-              [ -z "$dll" ] && continue
-              local base
-              base=$(basename "$dll")
-              if [ ! -f "release/phira-mp-server-windows-amd64/$base" ] && [ -f "$dll" ]; then
-                cp "$dll" release/phira-mp-server-windows-amd64/
-                collect_dlls "$dll"
-              fi
-            done
-          }
-          collect_dlls phira-mp-server.exe
+          # Use ntldd to find all non-system DLL dependencies.
+          # ntldd is the reliable way to do this on MSYS2 (avoids ldd quirks).
+          # -R = recursive (includes transitive deps)
+          echo "=== DLL dependencies ==="
+          ntldd -R phira-mp-server.exe
 
-          cp -r locales release/phira-mp-server-windows-amd64/
+          # Copy every DLL that lives under /ucrt64/
+          ntldd -R phira-mp-server.exe | grep -i '\/ucrt64\/' | sed 's/.*=> *//' | sed 's/ *(.*//' | sort -u | while IFS= read -r dll
+          do
+            dll=$(echo "$dll" | xargs)
+            if [ -n "$dll" ] && [ -f "$dll" ]; then
+              echo "  COPY: $dll"
+              cp "$dll" "$DEST/"
+            fi
+          done
 
-          echo "===== Package contents ====="
-          ls -la release/phira-mp-server-windows-amd64/
+          cp -r locales "$DEST/"
+
+          echo ""
+          echo "=== Final package contents ==="
+          ls -la "$DEST/"
 
       - name: Create zip
         shell: pwsh
         run: |
           Compress-Archive -Path release/phira-mp-server-windows-amd64 -DestinationPath release/phira-mp-server-windows-amd64.zip
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: phira-mp-server-windows-amd64
           path: release/phira-mp-server-windows-amd64.zip
 
   # ═══════════════════════════════════════════════════════════════════
-  # Release — create GitHub Release when a tag is pushed
+  # Release
   # ═══════════════════════════════════════════════════════════════════
   release:
-    needs: [build-linux, build-windows]
+    needs: [build-linux-amd64, build-linux-arm, build-windows]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: List artifacts
-        run: find artifacts -type f | sort
+      - run: find artifacts -type f | sort
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/phira-mp-server-linux-amd64/*.tar.gz
