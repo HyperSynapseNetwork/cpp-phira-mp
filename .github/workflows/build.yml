@@ -15,13 +15,16 @@ jobs:
   # ═══════════════════════════════════════════════════════════════════
   # Linux — Ubuntu 24.04: native amd64 + cross-compile arm64/armhf
   #
-  # Library strategy:
-  #   apt: openssl, curl, zlib, uuid, brotli, nghttp2, zstd, psl,
-  #        idn2, unistring, krb5  (all provide .a files)
-  #   source: fmt, spdlog, argon2  (small, avoids version issues)
+  # Library strategy — all static:
+  #   apt:    openssl, zlib, uuid, boost (headers), nlohmann_json (headers)
+  #   source: curl (minimal: OpenSSL+zlib only, no SSH/LDAP/GSSAPI/RTMP),
+  #           fmt, spdlog, argon2
+  #
+  # Building curl from source avoids Ubuntu's massive transitive
+  # dependency chain (libssh, gnutls, sasl2, krb5, gmp, nettle, ldap…)
   # ═══════════════════════════════════════════════════════════════════
   build-linux:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -64,9 +67,7 @@ jobs:
         if: matrix.is_cross
         run: |
           sudo dpkg --add-architecture ${{ matrix.deb_arch }}
-          # Restrict existing sources to amd64
           sudo sed -i '/^URIs:/i Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
-          # Add ports for cross-arch
           CODENAME=$(lsb_release -cs)
           printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports\nSuites: %s %s-updates %s-security\nComponents: main universe\nArchitectures: %s\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
             "$CODENAME" "$CODENAME" "$CODENAME" "${{ matrix.deb_arch }}" \
@@ -89,33 +90,45 @@ jobs:
           # Header-only (arch-independent)
           sudo apt-get install -y libboost-dev nlohmann-json3-dev
 
-          # Libraries with static archives
+          # Only libs with clean static archives (no transitive dep hell)
           sudo apt-get install -y \
             libssl-dev${S} \
-            libcurl4-openssl-dev${S} \
             zlib1g-dev${S} \
-            uuid-dev${S} \
-            libbrotli-dev${S} \
-            libnghttp2-dev${S} \
-            libzstd-dev${S} \
-            libpsl-dev${S} \
-            libidn2-dev${S} \
-            libunistring-dev${S} \
-            libkrb5-dev${S} \
-            libldap-dev${S} \
-            libgssapi-krb5-2${S} \
-            librtmp-dev${S} 2>/dev/null || true
-
-          # Verify key static libraries
-          LIBDIR="/usr/lib/${{ matrix.triple }}"
-          echo "=== Static libraries in ${LIBDIR} ==="
-          for lib in ssl crypto curl z uuid brotlidec brotlicommon nghttp2 zstd psl idn2; do
-            if [ -f "${LIBDIR}/lib${lib}.a" ]; then echo "  OK   lib${lib}.a"
-            else echo "  MISS lib${lib}.a"; fi
-          done
+            uuid-dev${S}
 
       - name: Prepare sysroot
         run: mkdir -p $SYSROOT/lib/pkgconfig $SYSROOT/include
+
+      - name: Build curl from source (minimal — OpenSSL + zlib only)
+        run: |
+          LIBDIR="/usr/lib/${{ matrix.triple }}"
+          cd /tmp && git clone --depth 1 --branch curl-8_6_0 https://github.com/curl/curl.git && cd curl
+          cmake -B build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_INSTALL_PREFIX=$SYSROOT \
+            -DCMAKE_PREFIX_PATH="$SYSROOT;${LIBDIR}" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_CURL_EXE=OFF \
+            -DBUILD_TESTING=OFF \
+            -DCURL_USE_OPENSSL=ON \
+            -DOPENSSL_ROOT_DIR=/usr \
+            -DOPENSSL_INCLUDE_DIR=/usr/include \
+            -DOPENSSL_SSL_LIBRARY=${LIBDIR}/libssl.a \
+            -DOPENSSL_CRYPTO_LIBRARY=${LIBDIR}/libcrypto.a \
+            -DCURL_ZLIB=ON \
+            -DZLIB_LIBRARY=${LIBDIR}/libz.a \
+            -DZLIB_INCLUDE_DIR=/usr/include \
+            -DCURL_USE_LIBSSH2=OFF \
+            -DCURL_USE_LIBSSH=OFF \
+            -DCURL_USE_LIBPSL=OFF \
+            -DUSE_LIBIDN2=OFF \
+            -DCURL_DISABLE_LDAP=ON \
+            -DCURL_DISABLE_LDAPS=ON \
+            -DUSE_NGHTTP2=OFF \
+            -DCURL_USE_GSSAPI=OFF \
+            -DENABLE_ARES=OFF
+          cmake --build build -j$(nproc) && cmake --install build
 
       - name: Build fmt from source
         run: |
@@ -158,40 +171,17 @@ jobs:
         run: |
           LIBDIR="/usr/lib/${{ matrix.triple }}"
 
-          # Collect CFLAGS from pkg-config (include paths + defines)
-          export PKG_CONFIG_PATH="${SYSROOT}/lib/pkgconfig:${SYSROOT}/lib64/pkgconfig:${LIBDIR}/pkgconfig:/usr/share/pkgconfig"
-          export PKG_CONFIG_LIBDIR="${PKG_CONFIG_PATH}"
-          PKG_CFLAGS=$(pkg-config --cflags spdlog openssl libcurl nlohmann_json 2>/dev/null || true)
-
-          echo "PKG_CFLAGS: ${PKG_CFLAGS}"
-
-          # Determine which static libs are available for curl's deps
-          CURL_EXTRA=""
-          for lib in nghttp2 zstd brotlidec brotlicommon psl idn2 unistring; do
-            [ -f "${LIBDIR}/lib${lib}.a" ] && CURL_EXTRA="${CURL_EXTRA} -l${lib}"
-          done
-          # Kerberos / GSSAPI (libcurl on Ubuntu is compiled with these)
-          for lib in gssapi_krb5 krb5 k5crypto com_err krb5support rtmp; do
-            [ -f "${LIBDIR}/lib${lib}.a" ] && CURL_EXTRA="${CURL_EXTRA} -l${lib}"
-          done
-          # LDAP (try both ldap_r and ldap)
-          if [ -f "${LIBDIR}/libldap.a" ]; then CURL_EXTRA="${CURL_EXTRA} -lldap -llber"; fi
-
-          echo "CURL_EXTRA: ${CURL_EXTRA}"
-
           make -j$(nproc) \
             CXX="${{ matrix.cxx }}" \
             TARGET=phira-mp-server \
             CXXFLAGS="-std=c++20 -Wall -Wextra -O2 -pthread \
               -DLOCALES_DIR=./locales \
               -DSPDLOG_FMT_EXTERNAL -DSPDLOG_COMPILED_LIB \
-              -I${SYSROOT}/include \
-              ${PKG_CFLAGS}" \
+              -I${SYSROOT}/include" \
             LDFLAGS="-static -L${SYSROOT}/lib -L${LIBDIR}" \
             LIBS="-lspdlog -lfmt \
               -lcurl -lssl -lcrypto \
               -largon2 -luuid -lz \
-              ${CURL_EXTRA} \
               -lpthread -ldl"
 
           file phira-mp-server
@@ -269,11 +259,8 @@ jobs:
           mkdir -p "$DEST"
           cp phira-mp-server.exe "$DEST/"
 
-          # ntldd outputs Windows-native paths (backslashes):
-          #   libfoo.dll => D:\a\_temp\msys64\ucrt64\bin\libfoo.dll (0x...)
-          # Strategy: grep for 'ucrt64', take the DLL name (col 1), copy from /ucrt64/bin/
           echo "=== Collecting UCRT64 DLLs ==="
-          ntldd -R phira-mp-server.exe | grep -i 'ucrt64' | awk '{gsub(/\t/," "); print $1}' | sort -u | while IFS= read -r dllname
+          ntldd -R phira-mp-server.exe | grep -i 'ucrt64' | awk '{print $1}' | sort -u | while IFS= read -r dllname
           do
             dllname=$(echo "$dllname" | tr -d '[:space:]')
             if [ -n "$dllname" ] && [ -f "/ucrt64/bin/$dllname" ]; then
