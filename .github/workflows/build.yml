@@ -82,7 +82,8 @@ jobs:
             libssl-dev${S} \
             libcurl4-openssl-dev${S} \
             zlib1g-dev${S} \
-            uuid-dev${S}
+            uuid-dev${S} \
+            libsqlite3-dev${S}
 
       - name: Prepare sysroot
         run: mkdir -p $SYSROOT/lib/pkgconfig $SYSROOT/include
@@ -137,12 +138,12 @@ jobs:
               -DLOCALES_DIR=./locales \
               -DSPDLOG_FMT_EXTERNAL -DSPDLOG_COMPILED_LIB \
               -I${SYSROOT}/include \
-              $(pkg-config --cflags openssl libcurl nlohmann_json 2>/dev/null || true)" \
+              $(pkg-config --cflags openssl libcurl nlohmann_json sqlite3 2>/dev/null || true)" \
             LDFLAGS="-L${SYSROOT}/lib -L${LIBDIR} \
               -Wl,-rpath,'\$\$ORIGIN/lib'" \
             LIBS="-lspdlog -lfmt \
               -lcurl -lssl -lcrypto \
-              -largon2 -luuid -lz \
+              -largon2 -luuid -lz -lsqlite3 \
               -lpthread -ldl"
 
           file phira-mp-server
@@ -161,38 +162,55 @@ jobs:
           # Download CA certificate bundle
           curl -sL -o "$DEST/cacert.pem" https://curl.se/ca/cacert.pem
 
-          # Collect all non-system .so dependencies
-          # For native amd64, use ldd directly; for cross, use objdump to find NEEDED
-          if [ "${{ matrix.is_cross }}" = "true" ]; then
-            # Cross: parse ELF NEEDED entries
-            NEEDED=$(${{ matrix.triple }}-objdump -p phira-mp-server | grep NEEDED | awk '{print $2}')
-          else
-            NEEDED=$(ldd phira-mp-server | awk '{print $1}')
-          fi
-
+          # ── Collect ALL .so dependencies with correct sonames ──
+          # The key insight: ldd output shows "soname => /full/path (0x...)"
+          # We must copy the FILE at /full/path but name it as the SONAME.
+          # This avoids the bug where libfoo.so.2 is needed but we copy
+          # libfoo.so.2.0.25 (wrong name).
           echo "=== Collecting .so files ==="
-          for soname in $NEEDED; do
-            # Skip system libs (libc, libm, libdl, libpthread, ld-linux, libgcc, libstdc++)
-            case "$soname" in
-              linux-*|ld-*|libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libgcc_s*|libstdc++*) continue ;;
-            esac
-            # Search in sysroot and system lib dirs
-            for dir in "$SYSROOT/lib" "$LIBDIR" "/usr/lib" "/lib/${TRIPLE}"; do
-              found=$(find "$dir" -name "$soname" -o -name "${soname}*" 2>/dev/null | head -1)
-              if [ -n "$found" ] && [ -f "$found" ]; then
-                echo "  COPY: $found"
-                cp -L "$found" "$DEST/lib/"
-                break
-              fi
-            done
-          done
 
-          # Create a wrapper script that sets LD_LIBRARY_PATH
+          collect_libs() {
+            local binary="$1"
+            if [ "${{ matrix.is_cross }}" = "true" ]; then
+              # Cross: use readelf to get NEEDED, then find+copy with soname
+              ${{ matrix.triple }}-readelf -d "$binary" 2>/dev/null | grep NEEDED | sed 's/.*\[\(.*\)\]/\1/' | while read -r soname; do
+                case "$soname" in
+                  linux-*|ld-*|libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libgcc_s*|libstdc++*) continue ;;
+                esac
+                [ -f "$DEST/lib/$soname" ] && continue
+                for dir in "$SYSROOT/lib" "$LIBDIR" "/usr/lib" "/lib/${TRIPLE}"; do
+                  real=$(find "$dir" -name "${soname}*" 2>/dev/null | head -1)
+                  if [ -n "$real" ] && [ -e "$real" ]; then
+                    cp -L "$real" "$DEST/lib/$soname"
+                    echo "  COPY: $real -> lib/$soname"
+                    break
+                  fi
+                done
+              done
+            else
+              # Native: use ldd which recursively resolves ALL deps
+              ldd "$binary" 2>/dev/null | while read -r line; do
+                # Parse: "libfoo.so.2 => /usr/lib/x86_64-linux-gnu/libfoo.so.2 (0x...)"
+                soname=$(echo "$line" | awk '{print $1}')
+                realpath=$(echo "$line" | awk '{print $3}')
+                case "$soname" in
+                  linux-*|ld-*|libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libgcc_s*|libstdc++*) continue ;;
+                esac
+                [ -z "$realpath" ] || [ ! -f "$realpath" ] && continue
+                [ -f "$DEST/lib/$soname" ] && continue
+                cp -L "$realpath" "$DEST/lib/$soname"
+                echo "  COPY: $realpath -> lib/$soname"
+              done
+            fi
+          }
+          collect_libs phira-mp-server
+
+          # Create start.sh wrapper
           printf '#!/bin/sh\nDIR="$(cd "$(dirname "$0")" && pwd)"\nexport LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"\nexec "$DIR/phira-mp-server" "$@"\n' > "$DEST/start.sh"
           chmod +x "$DEST/start.sh"
 
-          # Also set RPATH on the binary to look in ./lib
-          if command -v patchelf >/dev/null 2>&1 && [ "${{ matrix.is_cross }}" = "false" ]; then
+          # Set RPATH on amd64
+          if [ "${{ matrix.is_cross }}" = "false" ] && command -v patchelf >/dev/null 2>&1; then
             patchelf --set-rpath '$ORIGIN/lib' "$DEST/phira-mp-server" || true
           fi
 
@@ -201,8 +219,7 @@ jobs:
           find "$DEST" -type f | sort
 
       - name: Create tarball
-        run: |
-          cd release && tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}/
+        run: cd release && tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -233,6 +250,7 @@ jobs:
             mingw-w64-ucrt-x86_64-nlohmann-json
             mingw-w64-ucrt-x86_64-curl
             mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-sqlite3
             mingw-w64-ucrt-x86_64-ntldd
 
       - name: Install or build argon2

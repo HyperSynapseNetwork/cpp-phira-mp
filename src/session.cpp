@@ -261,6 +261,10 @@ void Session::handle_auth(const ClientCommand& cmd) {
                     }
                     self->user = up; up->set_session(self->weak_from_this());
                     if (cat == SessionCategory::GameMonitor) srv->set_game_monitor(r2.id, self->weak_from_this());
+
+                    // Record visitor (positive IDs only)
+                    if (r2.id > 0) srv->visitor_db.record_visit(r2.id);
+
                     std::optional<ClientRoomState> rs;
                     { std::shared_lock lk(up->room_mu); if (up->room) rs = up->room->client_state(*up); }
                     self->try_send(ServerCommand::make_auth_ok(up->to_info(), rs));

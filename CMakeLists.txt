@@ -13,6 +13,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(SPDLOG REQUIRED IMPORTED_TARGET spdlog)
 pkg_check_modules(ARGON2 REQUIRED IMPORTED_TARGET libargon2)
 find_package(nlohmann_json 3.0 REQUIRED)
+pkg_check_modules(SQLITE3 REQUIRED IMPORTED_TARGET sqlite3)
 
 add_executable(phira-mp-server
     src/main.cpp
@@ -24,6 +25,7 @@ add_executable(phira-mp-server
     src/session.cpp
     src/server.cpp
     src/http_server.cpp
+    src/visitor_db.cpp
 )
 
 target_include_directories(phira-mp-server PRIVATE
@@ -38,6 +40,7 @@ target_link_libraries(phira-mp-server PRIVATE
     PkgConfig::SPDLOG
     PkgConfig::ARGON2
     nlohmann_json::nlohmann_json
+    PkgConfig::SQLITE3
     uuid
 )
 

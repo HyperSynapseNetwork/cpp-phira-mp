@@ -8,7 +8,7 @@ TARGET   ?= phira-mp-server
 
 SRCS := src/main.cpp src/binary.cpp src/command.cpp src/stream.cpp \
         src/l10n.cpp src/room.cpp src/session.cpp src/server.cpp \
-        src/http_server.cpp
+        src/http_server.cpp src/visitor_db.cpp
 
 OBJS := $(SRCS:.cpp=.o)
 
@@ -24,11 +24,11 @@ endif
 # ── pkg-config detection (skip if LIBS already provided externally) ───
 ifeq ($(LIBS),)
   ifeq ($(STATIC),1)
-    PKG_FLAGS := $(shell pkg-config --static --cflags spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
-    PKG_LIBS  := $(shell pkg-config --static --libs spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
+    PKG_FLAGS := $(shell pkg-config --static --cflags spdlog libargon2 nlohmann_json openssl libcurl sqlite3 2>/dev/null)
+    PKG_LIBS  := $(shell pkg-config --static --libs spdlog libargon2 nlohmann_json openssl libcurl sqlite3 2>/dev/null)
   else
-    PKG_FLAGS := $(shell pkg-config --cflags spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
-    PKG_LIBS  := $(shell pkg-config --libs spdlog libargon2 nlohmann_json openssl libcurl 2>/dev/null)
+    PKG_FLAGS := $(shell pkg-config --cflags spdlog libargon2 nlohmann_json openssl libcurl sqlite3 2>/dev/null)
+    PKG_LIBS  := $(shell pkg-config --libs spdlog libargon2 nlohmann_json openssl libcurl sqlite3 2>/dev/null)
   endif
   CXXFLAGS += $(PKG_FLAGS)
   LIBS     := $(PKG_LIBS) $(PLATFORM_LIBS) -lpthread

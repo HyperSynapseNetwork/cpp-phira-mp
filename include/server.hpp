@@ -1,5 +1,6 @@
 #pragma once
 #include "session.hpp"
+#include "visitor_db.hpp"
 #include <fstream>
 #include <set>
 #include <unordered_map>
@@ -26,6 +27,9 @@ public:
     // Ban system
     mutable std::shared_mutex ban_mu;
     std::set<int32_t> banned_users;
+
+    // Visitor database
+    VisitorDB visitor_db;
 
     // SSE broadcaster (set by main after creation)
     SseBroadcaster* sse_broadcaster = nullptr;

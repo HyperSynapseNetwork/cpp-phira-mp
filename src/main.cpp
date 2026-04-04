@@ -17,17 +17,20 @@ int main(int argc, char* argv[]) {
     uint16_t port = 12346;
     uint16_t http_port = 12347;
     std::string admin_password = "admin";
+    std::string db_path = "visitors.db";
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if ((a == "-p" || a == "--port") && i + 1 < argc) port = uint16_t(std::stoi(argv[++i]));
         else if ((a == "--http-port") && i + 1 < argc) http_port = uint16_t(std::stoi(argv[++i]));
         else if ((a == "--admin-password") && i + 1 < argc) admin_password = argv[++i];
+        else if ((a == "--db-path") && i + 1 < argc) db_path = argv[++i];
         else if (a == "-h" || a == "--help") {
             std::cerr << "Usage: " << argv[0]
-            << " [--port PORT] [--http-port HTTP_PORT] [--admin-password PASSWORD]\n"
-            << "  --port           TCP game protocol port (default: 12346)\n"
-            << "  --http-port      HTTP API/admin port (default: 12347)\n"
-            << "  --admin-password Admin panel password (default: admin)\n";
+                      << " [--port PORT] [--http-port HTTP_PORT] [--admin-password PASSWORD] [--db-path PATH]\n"
+                      << "  --port           TCP game protocol port (default: 12346)\n"
+                      << "  --http-port      HTTP API/admin port (default: 12347)\n"
+                      << "  --admin-password Admin panel password (default: admin)\n"
+                      << "  --db-path        Visitor database path (default: visitors.db)\n";
             return 0;
         }
     }
@@ -55,11 +58,11 @@ int main(int argc, char* argv[]) {
     // ── Localization ──────────────────────────────────────────────────
     {
         std::string dir;
-        #ifdef LOCALES_DIR
-        #define _PHIRA_STR(x) #x
-        #define PHIRA_STR(x) _PHIRA_STR(x)
+#ifdef LOCALES_DIR
+#define _PHIRA_STR(x) #x
+#define PHIRA_STR(x) _PHIRA_STR(x)
         dir = PHIRA_STR(LOCALES_DIR);
-        #endif
+#endif
         if (dir.empty() || !fs::exists(dir)) dir = "locales";
         if (!fs::exists(dir)) dir = "/usr/share/phira-mp/locales";
         L10n::instance().load(dir);
@@ -69,22 +72,28 @@ int main(int argc, char* argv[]) {
     spdlog::info("phira-mp-server starting");
     spdlog::info("  Game protocol port: {}", port);
     spdlog::info("  HTTP API/admin port: {}", http_port);
+    spdlog::info("  Visitor database: {}", db_path);
     std::cout << "Local Address: [::]:(" << port << " game, " << http_port << " http)\n";
 
     try {
         unsigned threads = std::thread::hardware_concurrency();
         if (!threads) threads = 4;
         asio::io_context ioc(threads);
-        #ifdef _WIN32
+#ifdef _WIN32
         asio::signal_set sigs(ioc, SIGINT);
-        #else
+#else
         asio::signal_set sigs(ioc, SIGINT, SIGTERM);
-        #endif
+#endif
         sigs.async_wait([&](const error_code&, int s) { spdlog::info("Signal {}, shutting down", s); ioc.stop(); });
 
         // Game protocol server
         Server srv(ioc, port);
         srv.start();
+
+        // Open visitor database
+        if (!srv.state()->visitor_db.open(db_path)) {
+            spdlog::warn("Could not open visitor database at '{}', visitor tracking disabled", db_path);
+        }
 
         // HTTP server (API + admin panel + SSE)
         HttpServer http_srv(ioc, http_port, srv.state(), admin_password);
