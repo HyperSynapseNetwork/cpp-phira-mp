@@ -39,7 +39,7 @@ ifeq ($(STATIC),1)
 endif
 
 LOCALES_DIR ?= $(CURDIR)/locales
-CXXFLAGS += -DLOCALES_DIR=\"$(LOCALES_DIR)\"
+CXXFLAGS += -DLOCALES_DIR=$(LOCALES_DIR)
 
 .PHONY: all clean
 

@@ -183,7 +183,7 @@ jobs:
             CXX="${{ matrix.cxx }}" \
             TARGET=phira-mp-server \
             CXXFLAGS="-std=c++20 -Wall -Wextra -O2 -pthread \
-              -DLOCALES_DIR=\"./locales\" \
+              -DLOCALES_DIR=./locales \
               -DSPDLOG_FMT_EXTERNAL -DSPDLOG_COMPILED_LIB \
               -I${SYSROOT}/include \
               ${PKG_CFLAGS}" \
@@ -260,7 +260,7 @@ jobs:
 
       - name: Build
         run: |
-          make -j$(nproc) TARGET=phira-mp-server.exe LOCALES_DIR=\"./locales\"
+          make -j$(nproc) TARGET=phira-mp-server.exe LOCALES_DIR=./locales
           file phira-mp-server.exe
 
       - name: Collect DLLs and package

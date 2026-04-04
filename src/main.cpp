@@ -24,10 +24,10 @@ int main(int argc, char* argv[]) {
         else if ((a == "--admin-password") && i + 1 < argc) admin_password = argv[++i];
         else if (a == "-h" || a == "--help") {
             std::cerr << "Usage: " << argv[0]
-                      << " [--port PORT] [--http-port HTTP_PORT] [--admin-password PASSWORD]\n"
-                      << "  --port           TCP game protocol port (default: 12346)\n"
-                      << "  --http-port      HTTP API/admin port (default: 12347)\n"
-                      << "  --admin-password Admin panel password (default: admin)\n";
+            << " [--port PORT] [--http-port HTTP_PORT] [--admin-password PASSWORD]\n"
+            << "  --port           TCP game protocol port (default: 12346)\n"
+            << "  --http-port      HTTP API/admin port (default: 12347)\n"
+            << "  --admin-password Admin panel password (default: admin)\n";
             return 0;
         }
     }
@@ -55,9 +55,11 @@ int main(int argc, char* argv[]) {
     // ── Localization ──────────────────────────────────────────────────
     {
         std::string dir;
-#ifdef LOCALES_DIR
-        dir = LOCALES_DIR;
-#endif
+        #ifdef LOCALES_DIR
+        #define _PHIRA_STR(x) #x
+        #define PHIRA_STR(x) _PHIRA_STR(x)
+        dir = PHIRA_STR(LOCALES_DIR);
+        #endif
         if (dir.empty() || !fs::exists(dir)) dir = "locales";
         if (!fs::exists(dir)) dir = "/usr/share/phira-mp/locales";
         L10n::instance().load(dir);
@@ -73,11 +75,11 @@ int main(int argc, char* argv[]) {
         unsigned threads = std::thread::hardware_concurrency();
         if (!threads) threads = 4;
         asio::io_context ioc(threads);
-#ifdef _WIN32
+        #ifdef _WIN32
         asio::signal_set sigs(ioc, SIGINT);
-#else
+        #else
         asio::signal_set sigs(ioc, SIGINT, SIGTERM);
-#endif
+        #endif
         sigs.async_wait([&](const error_code&, int s) { spdlog::info("Signal {}, shutting down", s); ioc.stop(); });
 
         // Game protocol server
