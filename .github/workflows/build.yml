@@ -162,58 +162,77 @@ jobs:
           # Download CA certificate bundle
           curl -sL -o "$DEST/cacert.pem" https://curl.se/ca/cacert.pem
 
-          # ── Collect ALL .so dependencies with correct sonames ──
-          # The key insight: ldd output shows "soname => /full/path (0x...)"
-          # We must copy the FILE at /full/path but name it as the SONAME.
-          # This avoids the bug where libfoo.so.2 is needed but we copy
-          # libfoo.so.2.0.25 (wrong name).
-          echo "=== Collecting .so files ==="
+          # ── Bundle ALL .so dependencies INCLUDING glibc ──
+          # This makes the package fully self-contained and independent
+          # of the target machine's glibc version.
+          # We also bundle ld-linux (the dynamic linker) and start.sh
+          # invokes it directly so the system ld-linux is never used.
+          echo "=== Collecting ALL .so files (including glibc) ==="
 
-          collect_libs() {
-            local binary="$1"
-            if [ "${{ matrix.is_cross }}" = "true" ]; then
-              # Cross: use readelf to get NEEDED, then find+copy with soname
+          if [ "${{ matrix.is_cross }}" = "true" ]; then
+            # Cross: use readelf NEEDED + recursive resolve
+            collect_cross() {
+              local binary="$1"
               ${{ matrix.triple }}-readelf -d "$binary" 2>/dev/null | grep NEEDED | sed 's/.*\[\(.*\)\]/\1/' | while read -r soname; do
-                case "$soname" in
-                  linux-*|ld-*|libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libgcc_s*|libstdc++*) continue ;;
-                esac
                 [ -f "$DEST/lib/$soname" ] && continue
-                for dir in "$SYSROOT/lib" "$LIBDIR" "/usr/lib" "/lib/${TRIPLE}"; do
-                  real=$(find "$dir" -name "${soname}*" 2>/dev/null | head -1)
+                for dir in "$SYSROOT/lib" "$LIBDIR" "/usr/lib" "/lib/${TRIPLE}" "/usr/${{ matrix.triple }}/lib"; do
+                  real=$(find "$dir" -name "$soname" -o -name "${soname}*" 2>/dev/null | head -1)
                   if [ -n "$real" ] && [ -e "$real" ]; then
                     cp -L "$real" "$DEST/lib/$soname"
                     echo "  COPY: $real -> lib/$soname"
+                    # Recurse into this .so's own deps
+                    collect_cross "$DEST/lib/$soname"
                     break
                   fi
                 done
               done
-            else
-              # Native: use ldd which recursively resolves ALL deps
-              ldd "$binary" 2>/dev/null | while read -r line; do
-                # Parse: "libfoo.so.2 => /usr/lib/x86_64-linux-gnu/libfoo.so.2 (0x...)"
-                soname=$(echo "$line" | awk '{print $1}')
-                realpath=$(echo "$line" | awk '{print $3}')
-                case "$soname" in
-                  linux-*|ld-*|libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libgcc_s*|libstdc++*) continue ;;
-                esac
-                [ -z "$realpath" ] || [ ! -f "$realpath" ] && continue
-                [ -f "$DEST/lib/$soname" ] && continue
-                cp -L "$realpath" "$DEST/lib/$soname"
-                echo "  COPY: $realpath -> lib/$soname"
-              done
+            }
+            collect_cross phira-mp-server
+            # Also copy the cross ld-linux
+            LDSO=$(find "/usr/${{ matrix.triple }}/lib" "$LIBDIR" "/lib/${TRIPLE}" -name "ld-linux-*" -o -name "ld-*.so*" 2>/dev/null | head -1)
+            if [ -n "$LDSO" ] && [ -e "$LDSO" ]; then
+              LDSO_NAME=$(basename "$LDSO")
+              cp -L "$LDSO" "$DEST/lib/$LDSO_NAME"
+              echo "  COPY ld: $LDSO -> lib/$LDSO_NAME"
             fi
-          }
-          collect_libs phira-mp-server
-
-          # Create start.sh wrapper
-          printf '#!/bin/sh\nDIR="$(cd "$(dirname "$0")" && pwd)"\nexport LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"\nexec "$DIR/phira-mp-server" "$@"\n' > "$DEST/start.sh"
-          chmod +x "$DEST/start.sh"
-
-          # Set RPATH on amd64
-          if [ "${{ matrix.is_cross }}" = "false" ] && command -v patchelf >/dev/null 2>&1; then
-            patchelf --set-rpath '$ORIGIN/lib' "$DEST/phira-mp-server" || true
+          else
+            # Native amd64: use ldd for complete recursive resolution
+            ldd phira-mp-server 2>/dev/null | while read -r line; do
+              soname=$(echo "$line" | awk '{print $1}')
+              realpath=$(echo "$line" | awk '{print $3}')
+              # Handle "not a dynamic executable" or lines without =>
+              [ -z "$realpath" ] || [ ! -f "$realpath" ] && continue
+              [ -f "$DEST/lib/$soname" ] && continue
+              cp -L "$realpath" "$DEST/lib/$soname"
+              echo "  COPY: $realpath -> lib/$soname"
+            done
+            # Copy ld-linux itself (it shows as first line without =>)
+            LDSO=$(ldd phira-mp-server 2>/dev/null | grep 'ld-linux' | awk '{print $1}')
+            if [ -n "$LDSO" ] && [ -f "$LDSO" ]; then
+              LDSO_NAME=$(basename "$LDSO")
+              cp -L "$LDSO" "$DEST/lib/$LDSO_NAME"
+              echo "  COPY ld: $LDSO -> lib/$LDSO_NAME"
+            fi
           fi
 
+          # ── Find the ld-linux filename for start.sh ──
+          LDSO_FILE=$(ls "$DEST/lib"/ld-linux-* "$DEST/lib"/ld-*.so* 2>/dev/null | head -1)
+          LDSO_BASE=$(basename "$LDSO_FILE" 2>/dev/null || echo "")
+
+          # ── Create start.sh that uses the BUNDLED ld-linux ──
+          # This is the key: by invoking ld-linux directly with --library-path,
+          # the program uses ONLY the bundled glibc + libs, never the system's.
+          if [ -n "$LDSO_BASE" ]; then
+            printf '#!/bin/sh\nDIR="$(cd "$(dirname "$0")" && pwd)"\nexec "$DIR/lib/%s" --library-path "$DIR/lib" "$DIR/phira-mp-server" "$@"\n' "$LDSO_BASE" > "$DEST/start.sh"
+          else
+            # Fallback: LD_LIBRARY_PATH method
+            printf '#!/bin/sh\nDIR="$(cd "$(dirname "$0")" && pwd)"\nexport LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"\nexec "$DIR/phira-mp-server" "$@"\n' > "$DEST/start.sh"
+          fi
+          chmod +x "$DEST/start.sh"
+
+          echo ""
+          echo "=== start.sh ==="
+          cat "$DEST/start.sh"
           echo ""
           echo "=== Package contents ==="
           find "$DEST" -type f | sort
