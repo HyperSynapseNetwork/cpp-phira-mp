@@ -42,7 +42,7 @@ target_link_libraries(phira-mp-server PRIVATE
 )
 
 target_compile_definitions(phira-mp-server PRIVATE
-    LOCALES_DIR="${CMAKE_SOURCE_DIR}/locales"
+    LOCALES_DIR=${CMAKE_SOURCE_DIR}/locales
 )
 
 install(TARGETS phira-mp-server DESTINATION bin)
