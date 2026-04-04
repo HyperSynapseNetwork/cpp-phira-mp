@@ -12,7 +12,7 @@
 - 一键解散任意房间
 - 一键踢出房间内任意玩家
 - 封禁/解封玩家 ID（封禁后连接时显示「你已被封禁」提示）
-- 封禁列表持久化存储在 `banned_users.txt`
+- 封禁列表持久化存储在 `banned_users.json`
 
 ### 2. API
 
@@ -51,7 +51,7 @@ SSE 连接内建 15 秒心跳保活机制，防止连接被中间件或防火墙
 sudo apt update
 
 # 安装编译工具和依赖
-sudo apt install -y build-essential g++ pkg-config uuid-dev curl libssl-dev libboost-dev libspdlog-dev libargon2-dev nlohmann-json3-dev libcurl4-openssl-dev
+sudo apt install -y build-essential g++ curl pkg-config uuid-dev libsqlite3-dev zlib1g-dev libssl-dev libboost-dev libspdlog-dev libargon2-dev libfmt-dev nlohmann-json3-dev libcurl4-openssl-dev make
 ```
 
 ### 所需依赖清单
@@ -61,11 +61,12 @@ sudo apt install -y build-essential g++ pkg-config uuid-dev curl libssl-dev libb
 | uuid-dev | `uuid-dev` | UUID 生成 |
 | curl | `curl` | HTTP 请求（获取 Phira API 数据） |
 | make | `build-essential` | 构建工具 |
-| pkg-config | `pkg-config` | - |
+| pkg-config | `pkg-config` | 构建工具 |
 | Boost | `libboost-dev` | 所需依赖 |
 | spdlog | `libspdlog-dev` | 日志等级实现 |
 | Argon2 | `libargon2-dev` | 二进制协议 |
 | Json3 | `nlohmann-json3-dev` | Json3 |
+| SQLite3 | `libsqlite3-dev` | 用户ID数据库实现 |
 | Curl-OpenSSL | `libcurl4-openssl-dev` | Curl和OpenSSL实现 |
 | OpenSSL | `libssl-dev` | SSL 支持 |
 
@@ -76,7 +77,7 @@ sudo apt install -y build-essential g++ pkg-config uuid-dev curl libssl-dev libb
 ```bash
 cd cpp-phira-mp
 make clean
-make
+make -j$(nproc)
 ```
 
 编译成功后生成 `phira-mp-server` 可执行文件。
@@ -85,7 +86,7 @@ make
 
 ## 下载
 
-你可以前往本项目的[Github Actions](../../actions)，下载已编译好可直接运行的 `exe` 和二进制文件。
+你可以前往本项目的[Github Actions](../../actions)，下载已编译好可直接运行的 `exe` 和启动脚本。（输入./start.sh即可运行）。
 
 
 ---
@@ -107,6 +108,7 @@ make
 | `--port` | 游戏服务器端口 | 12346 |
 | `--http-port` | Web 管理/API 端口 | 12347 |
 | `--admin-password` | 后台管理密码 | admin |
+| `--db-path` | 设置数据库`.db`文件路径 | visitors.db |
 | `-h, --help` | 显示帮助 | - |
 
 ---
@@ -124,16 +126,19 @@ cpp-phira-mp-main/
 │   ├── server.hpp          # 服务器 + get_state()
 │   ├── session.hpp         # 会话
 │   ├── stream.hpp          # 触摸信息流
+│   ├── visitor_db.hpp      # 访客数量记录
 ├── src/
 │   ├── binary.cpp          # 二进制协议实现
 │   ├── command.cpp         # 命令实现
-│   ├── http_server.cpp     # web/api实现
+│   ├── http_server.cpp     # Web网页/API实现
 │   ├── l10n.cpp            # 本地化实现
 │   ├── main.cpp            # 主入口
 │   ├── room.cpp            # 主逻辑实现
 │   ├── server.cpp          # 服务器
 │   ├── session.cpp         # 主逻辑实现
-│   └── stream.cpp          # [新增] 观战协议
+    ├── visitor_db.cpp      # 访客数量记录
+│   └── stream.cpp          # 观战协议
+│   
 ├── locales/
 │   ├── en-US.ftl
 │   ├── zh-CN.ftl
@@ -144,7 +149,7 @@ cpp-phira-mp-main/
 ```
 
 ### 运行时文件
-- `banned_user.txt` — 封禁玩家 ID 列表（自动创建/管理）
+- `banned_user.json` — 封禁玩家 ID 列表（自动创建/管理）
 
 ---
 
