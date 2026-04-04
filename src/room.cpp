@@ -84,9 +84,10 @@ void Room::send_as(const User& u, const std::string& content) {
 }
 void Room::on_state_change() { broadcast(ServerCommand::make_change_state(client_room_state())); }
 
-bool Room::on_user_leave(const User& u) {
+// ── FIX: on_user_leave now takes non-const ref (was const User& + const_cast) ──
+bool Room::on_user_leave(User& u) {
     { Message m; m.type = MessageType::LeaveRoom; m.user = u.id; m.name = u.name; send_msg(m); }
-    { std::unique_lock lk(u.room_mu); const_cast<User&>(u).room.reset(); }
+    { std::unique_lock lk(u.room_mu); u.room.reset(); }
     if (u.monitor.load(std::memory_order_seq_cst)) {
         std::unique_lock lk(monitors_mu_);
         monitors_.erase(std::remove_if(monitors_.begin(), monitors_.end(), [&](auto& w){ auto s = w.lock(); return !s || s->id == u.id; }), monitors_.end());
@@ -116,6 +117,9 @@ void Room::reset_game_time() {
     for (auto& u : get_users()) u->game_time.store(neg, std::memory_order_seq_cst);
 }
 
+// ── FIX: check_all_ready — re-check state after re-acquiring lock ────
+// Previously, two threads could both see "all ready" and both transition,
+// leading to double state transitions and corrupted rounds data.
 void Room::check_all_ready() {
     std::unique_lock lk(state_mu);
     if (state.type == InternalRoomState::Type::WaitForReady) {
@@ -124,11 +128,16 @@ void Room::check_all_ready() {
         for (auto& u : us) if (!state.started.count(u->id)) { all = false; break; }
         if (all) for (auto& m : ms) if (!state.started.count(m->id)) { all = false; break; }
         if (all) {
+            // ── Transition: WaitForReady → Playing ──
+            // Change state BEFORE unlocking to prevent another thread from
+            // also entering this branch.
+            state.type = InternalRoomState::Type::Playing;
+            state.results.clear(); state.aborted.clear(); state.started.clear();
             lk.unlock();
+
             spdlog::info("room {}: game start", id.to_string());
             Message m; m.type = MessageType::StartPlaying; send_msg(m);
             reset_game_time();
-            { std::unique_lock l2(state_mu); state.type = InternalRoomState::Type::Playing; state.results.clear(); state.aborted.clear(); state.started.clear(); }
             on_state_change();
         }
     } else if (state.type == InternalRoomState::Type::Playing) {
@@ -136,17 +145,19 @@ void Room::check_all_ready() {
         bool all = true;
         for (auto& u : us) if (!state.results.count(u->id) && !state.aborted.count(u->id)) { all = false; break; }
         if (all) {
-            lk.unlock();
-            { Message m; m.type = MessageType::GameEnd; send_msg(m); }
-            { std::unique_lock l2(state_mu);
-              if (state.type == InternalRoomState::Type::Playing) {
-                  std::unique_lock l3(rounds_mu); std::shared_lock l4(chart_mu);
-                  RoundData rd; rd.chart = chart ? chart->id : -1;
-                  for (auto& [uid, rec] : state.results) rd.records.push_back(rec);
-                  rounds.push_back(rd);
-                  state.type = InternalRoomState::Type::SelectChart; state.results.clear(); state.aborted.clear();
-              }
+            // ── Transition: Playing → SelectChart ──
+            // Transition state and collect round data while holding the lock.
+            { std::unique_lock l3(rounds_mu); std::shared_lock l4(chart_mu);
+              RoundData rd; rd.chart = chart ? chart->id : -1;
+              for (auto& [uid, rec] : state.results) rd.records.push_back(rec);
+              rounds.push_back(rd);
             }
+            state.type = InternalRoomState::Type::SelectChart;
+            state.results.clear(); state.aborted.clear();
+            lk.unlock();
+
+            { Message m; m.type = MessageType::GameEnd; send_msg(m); }
+
             if (is_cycle()) {
                 spdlog::debug("room {}: cycling", id.to_string());
                 std::shared_ptr<User> old_h, new_h;

@@ -22,7 +22,6 @@ static const std::string& get_ca_path() {
 
     namespace fs = std::filesystem;
 
-    // 1) Environment variable
     if (auto e = std::getenv("CURL_CA_BUNDLE")) {
         if (fs::exists(e)) { g_ca_path = e; spdlog::info("CA cert from env: {}", g_ca_path); return g_ca_path; }
     }
@@ -30,7 +29,6 @@ static const std::string& get_ca_path() {
         if (fs::exists(e)) { g_ca_path = e; spdlog::info("CA cert from env: {}", g_ca_path); return g_ca_path; }
     }
 
-    // 2) Next to the executable
     std::string exe_dir;
 #ifdef _WIN32
     wchar_t buf[MAX_PATH];
@@ -45,17 +43,15 @@ static const std::string& get_ca_path() {
         if (fs::exists(p)) { g_ca_path = p; spdlog::info("CA cert found: {}", g_ca_path); return g_ca_path; }
     }
 
-    // 3) Current working directory
     if (fs::exists("cacert.pem")) { g_ca_path = "cacert.pem"; spdlog::info("CA cert found: {}", g_ca_path); return g_ca_path; }
 
-    // 4) Common system locations
     for (auto loc : {"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
                      "/etc/ssl/cert.pem", "/usr/share/ca-certificates/cacert.pem"}) {
         if (fs::exists(loc)) { g_ca_path = loc; spdlog::info("CA cert found: {}", g_ca_path); return g_ca_path; }
     }
 
     spdlog::warn("No CA cert found; HTTPS verification may fail. Place cacert.pem next to the executable.");
-    return g_ca_path;  // empty — let curl use its default
+    return g_ca_path;
 }
 
 // ── CURL helper ───────────────────────────────────────────────────────
@@ -67,6 +63,9 @@ static std::string http_get(const std::string& url, const std::string& auth = ""
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L);      // ← PERF: fail fast on connect
+    curl_easy_setopt(c, CURLOPT_TCP_NODELAY, 1L);          // ← PERF: no Nagle for curl
+    curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);        // ← PERF: keepalive
     const auto& ca = get_ca_path();
     if (!ca.empty()) curl_easy_setopt(c, CURLOPT_CAINFO, ca.c_str());
     struct curl_slist* hdrs = nullptr;
@@ -150,22 +149,38 @@ std::shared_ptr<Session> Session::create(Uuid id, tcp::socket sock, std::shared_
 void Session::try_send(const ServerCommand& cmd) { if (stream_) stream_->send(cmd); }
 uint8_t Session::version() const { return stream_ ? stream_->version() : 0; }
 
+// ── FIX: Heartbeat — replaced recursive lambda with schedule_heartbeat() ──
+// The old code used a recursive lambda pattern:
+//   auto check = [](auto& self, ec) { ... timer->async_wait([&self](ec){ self(self,ec); }); };
+// The inner lambda captured `&self`, a reference to the parameter of the
+// outer invocation. After the outer invocation returned, the stack frame
+// was destroyed but the timer handler still held the dangling `&self`
+// reference → use-after-free → SEGFAULT.
+//
+// Fix: use a simple member function that re-schedules itself.
 void Session::start_heartbeat() {
     hb_timer_ = std::make_shared<asio::steady_timer>(ioc_);
-    auto ws = std::weak_ptr<Session>(shared_from_this()); auto srv = server_; auto sid = id;
-    auto check = [ws, srv, sid](auto& self, const error_code& ec) {
+    schedule_heartbeat();
+}
+
+void Session::schedule_heartbeat() {
+    if (!hb_timer_) return;
+    hb_timer_->expires_after(HEARTBEAT_DISCONNECT_TIMEOUT);
+    auto ws = weak_from_this();
+    hb_timer_->async_wait([ws](const error_code& ec) {
         if (ec) return;
-        auto s = ws.lock();
-        if (!s) return;
+        auto self = ws.lock();
+        if (!self) return;
         auto now = std::chrono::steady_clock::now();
         std::chrono::steady_clock::time_point last;
-        { std::lock_guard lk(s->last_recv_mu_); last = s->last_recv_; }
-        if (now - last > HEARTBEAT_DISCONNECT_TIMEOUT) { spdlog::warn("heartbeat timeout {}", sid.to_string()); srv->handle_lost_connection(sid); return; }
-        s->hb_timer_->expires_after(HEARTBEAT_DISCONNECT_TIMEOUT);
-        s->hb_timer_->async_wait([ws, srv, sid, &self](const error_code& ec) { self(self, ec); });
-    };
-    hb_timer_->expires_after(HEARTBEAT_DISCONNECT_TIMEOUT);
-    hb_timer_->async_wait([check](const error_code& ec) { check(check, ec); });
+        { std::lock_guard lk(self->last_recv_mu_); last = self->last_recv_; }
+        if (now - last > HEARTBEAT_DISCONNECT_TIMEOUT) {
+            spdlog::warn("heartbeat timeout {}", self->id.to_string());
+            self->server_->handle_lost_connection(self->id);
+            return;
+        }
+        self->schedule_heartbeat();
+    });
 }
 
 void Session::on_recv(ClientCommand cmd) {
@@ -189,7 +204,6 @@ static void send_re(std::shared_ptr<ServerState> srv, RoomEvent ev) {
 
 // ── Send welcome messages and available rooms ─────────────────────────
 static void send_welcome(std::shared_ptr<User> u, std::shared_ptr<ServerState> srv) {
-    // Welcome messages
     { Message m; m.type = MessageType::Chat; m.user = 0;
       m.content = "欢迎连接到Phira多人游戏服务器！";
       u->try_send(ServerCommand::make_message(m)); }
@@ -197,7 +211,6 @@ static void send_welcome(std::shared_ptr<User> u, std::shared_ptr<ServerState> s
       m.content = "想要查询房间？加入1049578201交流群即可查询！";
       u->try_send(ServerCommand::make_message(m)); }
 
-    // Show available rooms (unlocked, in SelectChart state)
     std::vector<std::string> available;
     { std::shared_lock lk(srv->rooms_mu);
       for (auto& [name, room] : srv->rooms) {
@@ -238,7 +251,6 @@ void Session::handle_auth(const ClientCommand& cmd) {
                 asio::post(self->ioc_, [self, srv, sid, r, cmd_type]() {
                     if (self->panicked_.load()) return;
 
-                    // ── Ban check ──
                     auto r2 = r;
                     if (srv->is_banned(r2.id)) {
                         spdlog::info("banned user {} tried to connect", r2.id);
@@ -262,7 +274,6 @@ void Session::handle_auth(const ClientCommand& cmd) {
                     self->user = up; up->set_session(self->weak_from_this());
                     if (cat == SessionCategory::GameMonitor) srv->set_game_monitor(r2.id, self->weak_from_this());
 
-                    // Record visitor (positive IDs only)
                     if (r2.id > 0) srv->visitor_db.record_visit(r2.id);
 
                     std::optional<ClientRoomState> rs;
@@ -271,7 +282,6 @@ void Session::handle_auth(const ClientCommand& cmd) {
                     if (auto rm = srv->get_room_monitor()) rm->try_send(ServerCommand::make_user_visit(up->id));
                     self->waiting_auth_.store(false);
 
-                    // ── Welcome messages + available rooms ──
                     if (cat == SessionCategory::Normal) {
                         send_welcome(up, srv);
                     }
@@ -330,6 +340,15 @@ static void emit_room_sse(std::shared_ptr<ServerState> srv, const std::string& e
 }
 
 // ── process (authenticated commands) ──────────────────────────────────
+//
+// FIX: SelectChart and Played now run their HTTP calls on a worker
+// thread instead of blocking the io_context.  This prevents io_context
+// starvation which caused:
+//  (a) False heartbeat timeouts → premature handle_lost_connection on
+//      live sessions → use-after-free → segfault
+//  (b) Slow response to Ping → client-side disconnect → reconnect storm
+//  (c) All async operations frozen during the HTTP round-trip
+//
 std::optional<ServerCommand> Session::process(const ClientCommand& cmd) {
     auto& u = user; auto srv = server_;
     auto get_room = [&]() -> std::shared_ptr<Room> { std::shared_lock lk(u->room_mu); return u->room; };
@@ -370,7 +389,6 @@ std::optional<ServerCommand> Session::process(const ClientCommand& cmd) {
         { std::unique_lock lk(u->room_mu); u->room = rm; }
         spdlog::info("user {} create room {}", u->id, cmd.room_id.to_string());
 
-        // SSE: create_room event
         { nlohmann::json data;
           data["host"] = u->id;
           data["users"] = nlohmann::json::array({u->id});
@@ -404,7 +422,6 @@ std::optional<ServerCommand> Session::process(const ClientCommand& cmd) {
         for (auto& p : rm->get_monitors()) resp.users.push_back(p->to_info());
         resp.live = rm->is_live();
 
-        // SSE: join_room event
         if (!cmd.monitor) emit_room_sse(srv, "join_room", {{"room", cmd.room_id.to_string()}, {"user", u->id}});
 
         return ServerCommand::make_join_ok(resp);
@@ -417,7 +434,6 @@ std::optional<ServerCommand> Session::process(const ClientCommand& cmd) {
         if (rm->on_user_leave(*u)) { std::unique_lock lk(srv->rooms_mu); srv->rooms.erase(room_name); }
         { RoomEvent ev; ev.type = RoomEventType::LeaveRoom; ev.room = rm->id; ev.user_id = u->id; send_re(srv, ev); }
 
-        // SSE: leave_room event
         emit_room_sse(srv, "leave_room", {{"room", room_name}, {"user", u->id}});
 
         return ServerCommand::make_ok(ServerCommandType::LeaveRoom);
@@ -429,7 +445,6 @@ std::optional<ServerCommand> Session::process(const ClientCommand& cmd) {
         rm->set_locked(cmd.lock_val);
         { Message m; m.type = MessageType::LockRoom; m.lock_val = cmd.lock_val; rm->send_msg(m); }
         { PartialRoomData pd; pd.lock = cmd.lock_val; RoomEvent ev; ev.type = RoomEventType::UpdateRoom; ev.room = rm->id; ev.partial = pd; send_re(srv, ev); }
-        // SSE
         emit_room_sse(srv, "update_room", {{"room", rm->id.to_string()}, {"data", {{"lock", cmd.lock_val}}}});
         return ServerCommand::make_ok(ServerCommandType::LockRoom);
     }
@@ -443,22 +458,48 @@ std::optional<ServerCommand> Session::process(const ClientCommand& cmd) {
         emit_room_sse(srv, "update_room", {{"room", rm->id.to_string()}, {"data", {{"cycle", cmd.cycle_val}}}});
         return ServerCommand::make_ok(ServerCommandType::CycleRoom);
     }
+
+    // ── FIX: SelectChart — async HTTP (was blocking io_context) ──────
     case ClientCommandType::SelectChart: {
         if (category != SessionCategory::Normal) return ServerCommand::make_err(ServerCommandType::SelectChart, "invalid session");
         auto rm = get_room(); if (!rm) return ServerCommand::make_err(ServerCommandType::SelectChart, "no room");
         { std::shared_lock lk(rm->state_mu); if (rm->state.type != InternalRoomState::Type::SelectChart) return ServerCommand::make_err(ServerCommandType::SelectChart, "invalid state"); }
         try { rm->check_host_throw(*u); } catch (...) { return ServerCommand::make_err(ServerCommandType::SelectChart, "only host"); }
-        try {
-            auto body = http_get(PHIRA_HOST + "/chart/" + std::to_string(cmd.chart_id));
-            auto j = nlohmann::json::parse(body); ChartInfo ci; ci.id = j.at("id").get<int32_t>(); ci.name = j.at("name").get<std::string>();
-            { Message m; m.type = MessageType::SelectChart; m.user = u->id; m.name = ci.name; m.chart_id = ci.id; rm->send_msg(m); }
-            { std::unique_lock lk(rm->chart_mu); rm->chart = ci; }
-            rm->on_state_change();
-            { PartialRoomData pd; pd.chart = cmd.chart_id; RoomEvent ev; ev.type = RoomEventType::UpdateRoom; ev.room = rm->id; ev.partial = pd; send_re(srv, ev); }
-            emit_room_sse(srv, "update_room", {{"room", rm->id.to_string()}, {"data", {{"chart", cmd.chart_id}}}});
-            return ServerCommand::make_ok(ServerCommandType::SelectChart);
-        } catch (const std::exception& e) { return ServerCommand::make_err(ServerCommandType::SelectChart, e.what()); }
+
+        // Spawn worker thread for the blocking HTTP call
+        auto self = shared_from_this();
+        auto chart_id = cmd.chart_id;
+        std::thread([self, srv, rm, u, chart_id]() {
+            try {
+                auto body = http_get(PHIRA_HOST + "/chart/" + std::to_string(chart_id));
+                auto j = nlohmann::json::parse(body);
+                ChartInfo ci; ci.id = j.at("id").get<int32_t>(); ci.name = j.at("name").get<std::string>();
+                asio::post(self->ioc_, [self, srv, rm, u, ci, chart_id]() {
+                    if (self->panicked_.load()) return;
+                    // Re-check state (might have changed while HTTP was in-flight)
+                    { std::shared_lock lk(rm->state_mu);
+                      if (rm->state.type != InternalRoomState::Type::SelectChart) {
+                          self->try_send(ServerCommand::make_err(ServerCommandType::SelectChart, "state changed"));
+                          return;
+                      }
+                    }
+                    { Message m; m.type = MessageType::SelectChart; m.user = u->id; m.name = ci.name; m.chart_id = ci.id; rm->send_msg(m); }
+                    { std::unique_lock lk(rm->chart_mu); rm->chart = ci; }
+                    rm->on_state_change();
+                    { PartialRoomData pd; pd.chart = chart_id; RoomEvent ev; ev.type = RoomEventType::UpdateRoom; ev.room = rm->id; ev.partial = pd; send_re(srv, ev); }
+                    emit_room_sse(srv, "update_room", {{"room", rm->id.to_string()}, {"data", {{"chart", chart_id}}}});
+                    self->try_send(ServerCommand::make_ok(ServerCommandType::SelectChart));
+                });
+            } catch (const std::exception& e) {
+                std::string err = e.what();
+                asio::post(self->ioc_, [self, err]() {
+                    self->try_send(ServerCommand::make_err(ServerCommandType::SelectChart, err));
+                });
+            }
+        }).detach();
+        return std::nullopt;  // response sent asynchronously
     }
+
     case ClientCommandType::RequestStart: {
         if (category != SessionCategory::Normal) return ServerCommand::make_err(ServerCommandType::RequestStart, "invalid session");
         auto rm = get_room(); if (!rm) return ServerCommand::make_err(ServerCommandType::RequestStart, "no room");
@@ -508,42 +549,62 @@ std::optional<ServerCommand> Session::process(const ClientCommand& cmd) {
         }
         return ServerCommand::make_ok(ServerCommandType::CancelReady);
     }
+
+    // ── FIX: Played — async HTTP (was blocking io_context) ───────────
     case ClientCommandType::Played: {
         if (category != SessionCategory::Normal) return ServerCommand::make_err(ServerCommandType::Played, "invalid session");
         auto rm = get_room(); if (!rm) return ServerCommand::make_err(ServerCommandType::Played, "no room");
-        try {
-            auto body = http_get(PHIRA_HOST + "/record/" + std::to_string(cmd.chart_id));
-            Record rec = Record::from_json(body);
-            if (rec.player != u->id) return ServerCommand::make_err(ServerCommandType::Played, "invalid record");
-            { Message m; m.type = MessageType::Played; m.user = u->id; m.score_val = rec.score; m.accuracy = rec.accuracy; m.full_combo = rec.full_combo; rm->send_msg(m); }
-            { std::unique_lock lk(rm->state_mu);
-              if (rm->state.type == InternalRoomState::Type::Playing) {
-                  if (rm->state.aborted.count(u->id)) return ServerCommand::make_err(ServerCommandType::Played, "aborted");
-                  if (rm->state.results.count(u->id)) return ServerCommand::make_err(ServerCommandType::Played, "already uploaded");
-                  rm->state.results[u->id] = rec;
-              }
-            }
 
-            // SSE: player_score
-            emit_room_sse(srv, "player_score", {{"room", rm->id.to_string()}, {"record", {
-                {"id", rec.id}, {"player", rec.player}, {"score", rec.score},
-                {"perfect", rec.perfect}, {"good", rec.good}, {"bad", rec.bad},
-                {"miss", rec.miss}, {"max_combo", rec.max_combo},
-                {"accuracy", rec.accuracy}, {"full_combo", rec.full_combo},
-                {"std", rec.std_val}, {"std_score", rec.std_score}
-            }}});
+        // Spawn worker thread for the blocking HTTP call
+        auto self = shared_from_this();
+        auto chart_id = cmd.chart_id;
+        std::thread([self, srv, rm, u, chart_id]() {
+            try {
+                auto body = http_get(PHIRA_HOST + "/record/" + std::to_string(chart_id));
+                Record rec = Record::from_json(body);
+                asio::post(self->ioc_, [self, srv, rm, u, rec, chart_id]() {
+                    if (self->panicked_.load()) return;
+                    if (rec.player != u->id) {
+                        self->try_send(ServerCommand::make_err(ServerCommandType::Played, "invalid record"));
+                        return;
+                    }
+                    { Message m; m.type = MessageType::Played; m.user = u->id; m.score_val = rec.score; m.accuracy = rec.accuracy; m.full_combo = rec.full_combo; rm->send_msg(m); }
+                    { std::unique_lock lk(rm->state_mu);
+                      if (rm->state.type == InternalRoomState::Type::Playing) {
+                          if (rm->state.aborted.count(u->id)) { self->try_send(ServerCommand::make_err(ServerCommandType::Played, "aborted")); return; }
+                          if (rm->state.results.count(u->id)) { self->try_send(ServerCommand::make_err(ServerCommandType::Played, "already uploaded")); return; }
+                          rm->state.results[u->id] = rec;
+                      }
+                    }
 
-            rm->check_all_ready();
-            { std::shared_lock lk(rm->state_mu);
-              if (rm->state.type == InternalRoomState::Type::SelectChart) {
-                  { std::shared_lock rl(rm->rounds_mu); if (!rm->rounds.empty()) { RoomEvent ev; ev.type = RoomEventType::NewRound; ev.room = rm->id; ev.round = rm->rounds.back(); send_re(srv, ev); } }
-                  PartialRoomData pd; pd.state = StrippedRoomState::SelectingChart; RoomEvent ev; ev.type = RoomEventType::UpdateRoom; ev.room = rm->id; ev.partial = pd; send_re(srv, ev);
-                  emit_room_sse(srv, "update_room", {{"room", rm->id.to_string()}, {"data", {{"state", "SELECTING_CHART"}}}});
-              }
+                    emit_room_sse(srv, "player_score", {{"room", rm->id.to_string()}, {"record", {
+                        {"id", rec.id}, {"player", rec.player}, {"score", rec.score},
+                        {"perfect", rec.perfect}, {"good", rec.good}, {"bad", rec.bad},
+                        {"miss", rec.miss}, {"max_combo", rec.max_combo},
+                        {"accuracy", rec.accuracy}, {"full_combo", rec.full_combo},
+                        {"std", rec.std_val}, {"std_score", rec.std_score}
+                    }}});
+
+                    rm->check_all_ready();
+                    { std::shared_lock lk(rm->state_mu);
+                      if (rm->state.type == InternalRoomState::Type::SelectChart) {
+                          { std::shared_lock rl(rm->rounds_mu); if (!rm->rounds.empty()) { RoomEvent ev; ev.type = RoomEventType::NewRound; ev.room = rm->id; ev.round = rm->rounds.back(); send_re(srv, ev); } }
+                          PartialRoomData pd; pd.state = StrippedRoomState::SelectingChart; RoomEvent ev; ev.type = RoomEventType::UpdateRoom; ev.room = rm->id; ev.partial = pd; send_re(srv, ev);
+                          emit_room_sse(srv, "update_room", {{"room", rm->id.to_string()}, {"data", {{"state", "SELECTING_CHART"}}}});
+                      }
+                    }
+                    self->try_send(ServerCommand::make_ok(ServerCommandType::Played));
+                });
+            } catch (const std::exception& e) {
+                std::string err = e.what();
+                asio::post(self->ioc_, [self, err]() {
+                    self->try_send(ServerCommand::make_err(ServerCommandType::Played, err));
+                });
             }
-            return ServerCommand::make_ok(ServerCommandType::Played);
-        } catch (const std::exception& e) { return ServerCommand::make_err(ServerCommandType::Played, e.what()); }
+        }).detach();
+        return std::nullopt;  // response sent asynchronously
     }
+
     case ClientCommandType::Abort: {
         if (category != SessionCategory::Normal) return ServerCommand::make_err(ServerCommandType::Abort, "invalid session");
         auto rm = get_room(); if (!rm) return ServerCommand::make_err(ServerCommandType::Abort, "no room");

@@ -21,7 +21,7 @@ public:
 
     int32_t id; std::string name; Lang lang;
     std::shared_ptr<ServerState> server;
-    asio::io_context& ioc;                           // ← NEW
+    asio::io_context& ioc;
     mutable std::shared_mutex session_mu, room_mu;
     std::weak_ptr<class Session> session;
     std::shared_ptr<Room> room;
@@ -29,7 +29,7 @@ public:
     std::atomic<uint32_t> game_time{0};
     std::mutex dangle_mu;
     std::shared_ptr<int> dangle_mark;
-    std::shared_ptr<asio::steady_timer> dangle_timer; // ← NEW: replaces detached thread
+    std::shared_ptr<asio::steady_timer> dangle_timer;
 };
 
 enum class SessionCategory { Normal, Console, RoomMonitor, GameMonitor };
@@ -52,6 +52,7 @@ private:
     void handle_auth(const ClientCommand& cmd);
     std::optional<ServerCommand> process(const ClientCommand& cmd);
     void start_heartbeat();
+    void schedule_heartbeat();   // ← FIX: replaces recursive lambda to avoid dangling reference
 
     std::shared_ptr<ServerState> server_;
     std::shared_ptr<TcpBinaryStream> stream_;

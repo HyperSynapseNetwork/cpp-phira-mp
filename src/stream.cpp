@@ -5,10 +5,25 @@
 #include <openssl/kdf.h>
 #include <cstdlib>
 
+#ifdef __linux__
+#include <netinet/tcp.h>  // TCP_QUICKACK
+#endif
+
 // ── TcpBinaryStream ───────────────────────────────────────────────────
 TcpBinaryStream::TcpBinaryStream(tcp::socket socket, asio::io_context& ioc)
     : socket_(std::move(socket)), ioc_(ioc), strand_(ioc) {
-    error_code ec; socket_.set_option(tcp::no_delay(true), ec);
+    error_code ec;
+    // ── TCP performance tuning ──────────────────────────────────────
+    socket_.set_option(tcp::no_delay(true), ec);                // disable Nagle
+    socket_.set_option(asio::socket_base::keep_alive(true), ec); // detect dead peers faster
+    // Increase socket buffer sizes for better throughput
+    socket_.set_option(asio::socket_base::send_buffer_size(128 * 1024), ec);
+    socket_.set_option(asio::socket_base::receive_buffer_size(128 * 1024), ec);
+#ifdef __linux__
+    // TCP_QUICKACK: disable delayed ACK for faster response
+    int quickack = 1;
+    ::setsockopt(socket_.native_handle(), IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof(quickack));
+#endif
 }
 TcpBinaryStream::~TcpBinaryStream() { error_code ec; socket_.close(ec); }
 
@@ -72,12 +87,11 @@ void TcpBinaryStream::read_body(uint32_t len) {
 // ──────────────────────────────────────────────────────────────────────
 // FIX: send() previously called do_write() while holding send_mutex_.
 // do_write() also locks send_mutex_ → instant deadlock on the first
-// message ever sent.  The auth response was never delivered, so the
-// Phira client saw a timeout.
+// message ever sent.
 //
-// Solution: release the lock before kicking off do_write(), and post
-// do_write() through the strand so that async_write calls are always
-// serialised.
+// OPTIMIZATION: do_write() now coalesces ALL pending packets into a
+// single buffer and issues ONE async_write, dramatically reducing the
+// number of syscalls and improving throughput/latency.
 // ──────────────────────────────────────────────────────────────────────
 void TcpBinaryStream::send(const ServerCommand& cmd) {
     std::vector<uint8_t> payload; BinaryWriter w(payload); cmd.write_to(w);
@@ -92,7 +106,6 @@ void TcpBinaryStream::send(const ServerCommand& cmd) {
         send_queue_.push(std::move(pkt));
         if (!sending_) { sending_ = true; start_write = true; }
     }
-    // Kick off writing *outside* the lock, via the strand
     if (start_write) {
         asio::post(strand_, [self = shared_from_this()]() { self->do_write(); });
     }
@@ -100,14 +113,32 @@ void TcpBinaryStream::send(const ServerCommand& cmd) {
 
 void TcpBinaryStream::do_write() {
     auto self = shared_from_this();
+    // ── Coalesce: drain ALL pending packets into one buffer ──────────
     std::vector<uint8_t> data;
-    { std::lock_guard<std::mutex> lk(send_mutex_);
-      if (send_queue_.empty()) { sending_ = false; return; }
-      data = std::move(send_queue_.front()); send_queue_.pop(); }
+    {
+        std::lock_guard<std::mutex> lk(send_mutex_);
+        if (send_queue_.empty()) { sending_ = false; return; }
+        // Pre-calculate total size for single allocation
+        size_t total = 0;
+        {
+            auto& q = send_queue_;
+            // Can't iterate std::queue, but we can drain it
+            std::queue<std::vector<uint8_t>> tmp;
+            while (!q.empty()) { total += q.front().size(); tmp.push(std::move(q.front())); q.pop(); }
+            send_queue_ = std::move(tmp);
+        }
+        data.reserve(total);
+        while (!send_queue_.empty()) {
+            auto& front = send_queue_.front();
+            data.insert(data.end(), front.begin(), front.end());
+            send_queue_.pop();
+        }
+    }
     auto buf = std::make_shared<std::vector<uint8_t>>(std::move(data));
     asio::async_write(socket_, asio::buffer(*buf),
         asio::bind_executor(strand_, [self, buf](error_code ec, size_t) {
             if (ec) { spdlog::error("write error: {}", ec.message()); return; }
+            // Check if more data arrived while we were writing
             self->do_write();
         }));
 }
@@ -115,15 +146,6 @@ void TcpBinaryStream::do_write() {
 // ──────────────────────────────────────────────────────────────────────
 // generate_secret_key — must produce byte-identical output to the Rust
 // phira_mp_common::generate_secret_key.
-//
-// Rust uses:
-//   Argon2::default()  → argon2id, version 0x13, t_cost=2, m_cost=19456, p_cost=1, output=32
-//   SaltString::encode_b64(b"some$random#salt")  → raw salt bytes
-//   hkdf::Hkdf::<Sha256>::new(None, ikm)  → full extract+expand (salt = empty)
-//   h.expand(info, &mut okm)
-//
-// The old C++ code had t=3, m=65536 and used HKDF expand-only, which
-// produced a completely different key → "secret key mismatch".
 // ──────────────────────────────────────────────────────────────────────
 std::vector<uint8_t> generate_secret_key(const std::string& info, size_t len) {
     const char* env = std::getenv("HSN_SECRET_KEY");
@@ -132,23 +154,17 @@ std::vector<uint8_t> generate_secret_key(const std::string& info, size_t len) {
 
     const uint8_t salt[] = "some$random#salt";
     std::vector<uint8_t> hash(32);
-    // Match Rust argon2 0.5.x defaults: t_cost=2, m_cost=19456 KiB, parallelism=1
     int rc = argon2id_hash_raw(2, 19456, 1, secret.data(), secret.size(),
                                salt, sizeof(salt)-1, hash.data(), hash.size());
     if (rc != ARGON2_OK)
         throw std::runtime_error(std::string("argon2 failed: ") + argon2_error_message(rc));
 
-    // Full HKDF (extract + expand) matching Rust hkdf::Hkdf::new(None, ikm)
-    // When salt is None in the Rust crate, it uses an all-zeros salt of
-    // hash-length (32 bytes for SHA-256).
     std::vector<uint8_t> okm(len);
     EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr);
     if (!ctx) throw std::runtime_error("HKDF init fail");
     EVP_PKEY_derive_init(ctx);
     EVP_PKEY_CTX_set_hkdf_md(ctx, EVP_sha256());
-    // Use EXTRACT_AND_EXPAND mode (the default, matching Rust's full HKDF)
     EVP_PKEY_CTX_hkdf_mode(ctx, EVP_PKEY_HKDEF_MODE_EXTRACT_AND_EXPAND);
-    // salt = NULL → OpenSSL uses all-zeros salt (matches Rust Hkdf::new(None, ..))
     EVP_PKEY_CTX_set1_hkdf_salt(ctx, nullptr, 0);
     EVP_PKEY_CTX_set1_hkdf_key(ctx, hash.data(), hash.size());
     EVP_PKEY_CTX_add1_hkdf_info(ctx, (const unsigned char*)info.data(), info.size());

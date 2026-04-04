@@ -45,7 +45,7 @@ public:
     void broadcast(const ServerCommand& c);
     void broadcast_monitors(const ServerCommand& c);
     void send_as(const User& u, const std::string& content);
-    bool on_user_leave(const User& u);   // returns true if room should be dropped
+    bool on_user_leave(User& u);   // ← FIX: non-const ref (was const User&, used const_cast)
     void on_state_change();
     void reset_game_time();
     void check_all_ready();

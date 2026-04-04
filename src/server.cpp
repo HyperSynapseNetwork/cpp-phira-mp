@@ -5,6 +5,10 @@
 #include <fstream>
 #include <nlohmann/json.hpp>
 
+#ifdef __linux__
+#include <netinet/tcp.h>
+#endif
+
 // ── ServerState ───────────────────────────────────────────────────────
 std::shared_ptr<Session> ServerState::get_room_monitor() { std::shared_lock lk(rm_mu); return room_monitor.lock(); }
 std::shared_ptr<Session> ServerState::get_game_monitor(int32_t id) { std::shared_lock lk(gm_mu); auto it = game_monitors.find(id); return it != game_monitors.end() ? it->second.lock() : nullptr; }
@@ -88,6 +92,20 @@ void Server::start() { spdlog::info("Listening on port {}", acceptor_.local_endp
 void Server::do_accept() {
     acceptor_.async_accept([this](error_code ec, tcp::socket sock) {
         if (!ec) {
+            // ── PERF: Pre-tune socket before handing to Session ──────
+            error_code opt_ec;
+            sock.set_option(tcp::no_delay(true), opt_ec);                     // disable Nagle
+            sock.set_option(asio::socket_base::keep_alive(true), opt_ec);     // detect dead peers
+#ifdef __linux__
+            // Reduce TCP keepalive timers for faster dead-peer detection
+            int keepidle = 30;   // seconds before first keepalive probe
+            int keepintvl = 10;  // seconds between probes
+            int keepcnt = 3;     // probes before giving up
+            ::setsockopt(sock.native_handle(), IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+            ::setsockopt(sock.native_handle(), IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+            ::setsockopt(sock.native_handle(), IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+#endif
+
             auto addr = sock.remote_endpoint(); auto uid = Uuid::generate();
             spdlog::info("Connection from {} ({})", addr.address().to_string(), uid.to_string());
             try {
