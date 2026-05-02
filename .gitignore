@@ -6,3 +6,4 @@ build/
 banned_users.json
 *.tar.gz
 *.zip
+visitors.db

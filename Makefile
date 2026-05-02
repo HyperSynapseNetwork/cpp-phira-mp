@@ -6,22 +6,20 @@ LIBS     ?=
 STATIC   ?= 0
 TARGET   ?= phira-mp-server
 
+# ── 新增 http_client.cpp ──
 SRCS := src/main.cpp src/binary.cpp src/command.cpp src/stream.cpp \
         src/l10n.cpp src/room.cpp src/session.cpp src/server.cpp \
-        src/http_server.cpp src/visitor_db.cpp
+        src/http_server.cpp src/visitor_db.cpp src/http_client.cpp
 
 OBJS := $(SRCS:.cpp=.o)
 
 # ── Platform-specific libraries ───────────────────────────────────────
-# Windows (MSYS2 / MinGW): use rpcrt4 for UUID, ws2_32 for sockets
-# Linux: use libuuid
 ifeq ($(OS),Windows_NT)
   PLATFORM_LIBS := -lrpcrt4 -lws2_32 -lmswsock
 else
   PLATFORM_LIBS := -luuid
 endif
 
-# ── pkg-config detection (skip if LIBS already provided externally) ───
 ifeq ($(LIBS),)
   ifeq ($(STATIC),1)
     PKG_FLAGS := $(shell pkg-config --static --cflags spdlog libargon2 nlohmann_json openssl libcurl sqlite3 2>/dev/null)
